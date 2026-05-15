@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: rcflp
+Version: 0.1.0
+Summary: Robust Congested Facility Location Problem — solvers and utilities
+Requires-Python: >=3.8
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: openpyxl
