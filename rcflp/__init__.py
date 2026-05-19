@@ -15,7 +15,8 @@ from rcflp.warmstart  import solve_robust_warmstart
 from rcflp.evaluate   import (evaluate_second_stage, evaluate_fixed_price,
                                compute_prices, compute_cost_breakdown,
                                compute_epsilon_scalar, sample_disruptions,
-                               worst_case_disruption, no_disruption_scenario)
+                               worst_case_disruption, no_disruption_scenario,
+                               compute_risk_metrics)
 """
 
 from rcflp.instance   import instancemaker
@@ -33,6 +34,7 @@ from rcflp.evaluate   import (
     sample_disruptions,
     worst_case_disruption,
     no_disruption_scenario,
+    compute_risk_metrics,
 )
 
 __all__ = [
@@ -50,4 +52,5 @@ __all__ = [
     "sample_disruptions",
     "worst_case_disruption",
     "no_disruption_scenario",
+    "compute_risk_metrics",
 ]

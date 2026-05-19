@@ -27,8 +27,11 @@ sample_disruptions      : generate random ε ∈ Ξ for Monte Carlo evaluation
 worst_case_disruption   : find ε* maximising recourse cost (wrapper for separation oracle)
 """
 
+import math
 import time
 import random
+
+import numpy as np
 
 import gurobipy as gp
 from gurobipy import GRB
@@ -598,6 +601,79 @@ def sample_disruptions(
         samples.append(eps)
 
     return samples
+
+
+# ---------------------------------------------------------------------------
+# Risk metrics from a sample of per-scenario profits
+# ---------------------------------------------------------------------------
+
+def compute_risk_metrics(
+    profits_nom: list,
+    profits_rob: list,
+) -> dict:
+    """
+    Compute risk-oriented metrics from parallel lists of per-scenario profits.
+
+    Both lists must have the same length (one entry per sampled scenario) and
+    correspond to the **same** set of disruption scenarios so that scenario-by-
+    scenario comparisons (regret) are meaningful.
+
+    Metrics
+    -------
+    For each solution (nominal / robust):
+
+    * ``min_profit``   — worst realised profit across all scenarios
+    * ``pct5_profit``  — 5th-percentile profit (≡ VaR at 95 % confidence)
+    * ``cvar5``        — CVaR at 5 %: mean of the worst 5 % of scenarios
+    * ``cvar10``       — CVaR at 10 %: mean of the worst 10 % of scenarios
+    * ``prob_loss``    — fraction of scenarios with negative profit P(π < 0)
+    * ``mean_regret``  — mean scenario regret vs. the better solution
+    * ``max_regret``   — worst-case scenario regret vs. the better solution
+
+    Regret definition: for each scenario k,
+        regret_k = max(π_nom_k, π_rob_k) − π_solution_k
+    This measures how much each solution falls short of the best available
+    option in that scenario (no MIP re-solve required).
+
+    Parameters
+    ----------
+    profits_nom : list of float  — per-scenario profits for the nominal solution
+    profits_rob : list of float  — per-scenario profits for the robust solution
+
+    Returns
+    -------
+    dict with keys ``"nominal"`` and ``"robust"``, each mapping metric name
+    to float value.  A summary ``"n_scenarios"`` key is also included.
+    """
+    if len(profits_nom) != len(profits_rob):
+        raise ValueError("profits_nom and profits_rob must have the same length.")
+
+    def _metrics(p_arr: np.ndarray, best_arr: np.ndarray) -> dict:
+        n   = len(p_arr)
+        k5  = max(1, math.ceil(0.05 * n))
+        k10 = max(1, math.ceil(0.10 * n))
+        sorted_p = np.sort(p_arr)
+        regret   = best_arr - p_arr
+        return {
+            "mean_profit":  float(np.mean(p_arr)),
+            "min_profit":   float(sorted_p[0]),
+            "pct5_profit":  float(np.percentile(p_arr, 5)),
+            "cvar5":        float(np.mean(sorted_p[:k5])),
+            "cvar10":       float(np.mean(sorted_p[:k10])),
+            "prob_loss":    float(np.mean(p_arr < 0)),
+            "mean_regret":  float(np.mean(regret)),
+            "max_regret":   float(np.max(regret)),
+        }
+
+    p_nom = np.array(profits_nom, dtype=float)
+    p_rob = np.array(profits_rob, dtype=float)
+    best  = np.maximum(p_nom, p_rob)   # scenario-wise best between the two
+
+    return {
+        "nominal":     _metrics(p_nom, best),
+        "robust":      _metrics(p_rob, best),
+        "n_scenarios": len(profits_nom),
+    }
 
 
 # ---------------------------------------------------------------------------
