@@ -132,92 +132,93 @@ def draw_violin(ax, data, x_center, half_width,
     return cv5
 
 
-# ── Load OOS data ─────────────────────────────────────────────────────────────
-oos = pd.read_excel(EXCEL, sheet_name="OOS_Raw")
+if __name__ == "__main__":
+ # ── Load OOS data ─────────────────────────────────────────────────────────────
+ oos = pd.read_excel(EXCEL, sheet_name="OOS_Raw")
 
-# ── Configuration — easy to change ──────────────────────────────────────────
-V_SCALE = 0.75
-W_VAL   = 10
-GAMMAS  = [1, 2, 3, 4]
-COLS    = ("profit_a_nom", "profit_a_rob")
-HALF_W  = 0.32          # half-width of each violin
-GAP     = 0.08          # gap between the two violins in a pair
-GROUP_W = 2.0           # x-distance between Gamma groups
+ # ── Configuration — easy to change ──────────────────────────────────────────
+ V_SCALE = 0.75
+ W_VAL   = 10
+ GAMMAS  = [1, 2, 3, 4]
+ COLS    = ("profit_a_nom", "profit_a_rob")
+ HALF_W  = 0.32          # half-width of each violin
+ GAP     = 0.08          # gap between the two violins in a pair
+ GROUP_W = 2.0           # x-distance between Gamma groups
 
-sub = oos[(oos["v_scale"] == V_SCALE) & (oos["w"] == W_VAL)]
+ sub = oos[(oos["v_scale"] == V_SCALE) & (oos["w"] == W_VAL)]
 
-# ── Build figure ──────────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(10, 5.5))
+ # ── Build figure ──────────────────────────────────────────────────────────────
+ fig, ax = plt.subplots(figsize=(10, 5.5))
 
-x_ticks, x_labels = [], []
-cvar_summary = {}
+ x_ticks, x_labels = [], []
+ cvar_summary = {}
 
-for gi, gam in enumerate(GAMMAS):
-    g = sub[sub["gamma"] == gam]
-    arr_nom = g["profit_a_nom"].values
-    arr_rob = g["profit_a_rob"].values
+ for gi, gam in enumerate(GAMMAS):
+     g = sub[sub["gamma"] == gam]
+     arr_nom = g["profit_a_nom"].values
+     arr_rob = g["profit_a_rob"].values
 
-    x_base  = gi * GROUP_W
-    x_nom   = x_base - (HALF_W + GAP / 2)
-    x_rob   = x_base + (HALF_W + GAP / 2)
+     x_base  = gi * GROUP_W
+     x_nom   = x_base - (HALF_W + GAP / 2)
+     x_rob   = x_base + (HALF_W + GAP / 2)
 
-    lbl_nom = "Nominal $x$"  if gi == 0 else None
-    lbl_rob = "Robust $x$"   if gi == 0 else None
+     lbl_nom = "Nominal $x$"  if gi == 0 else None
+     lbl_rob = "Robust $x$"   if gi == 0 else None
 
-    cv_nom = draw_violin(ax, arr_nom, x_nom, HALF_W,
-                         NOM_LIGHT, NOM_DARK, label=lbl_nom)
-    cv_rob = draw_violin(ax, arr_rob, x_rob, HALF_W,
-                         ROB_LIGHT, ROB_DARK, label=lbl_rob)
+     cv_nom = draw_violin(ax, arr_nom, x_nom, HALF_W,
+                          NOM_LIGHT, NOM_DARK, label=lbl_nom)
+     cv_rob = draw_violin(ax, arr_rob, x_rob, HALF_W,
+                          ROB_LIGHT, ROB_DARK, label=lbl_rob)
 
-    cvar_summary[gam] = (cv_nom, cv_rob)
-    x_ticks.append(x_base)
-    x_labels.append(f"$\\Gamma = {gam}$")
+     cvar_summary[gam] = (cv_nom, cv_rob)
+     x_ticks.append(x_base)
+     x_labels.append(f"$\\Gamma = {gam}$")
 
-# ── Reference line at 0 ──────────────────────────────────────────────────────
-ax.axhline(0, color="black", lw=0.9, linestyle=":", zorder=1, alpha=0.6)
+ # ── Reference line at 0 ──────────────────────────────────────────────────────
+ ax.axhline(0, color="black", lw=0.9, linestyle=":", zorder=1, alpha=0.6)
 
-# ── Axes ─────────────────────────────────────────────────────────────────────
-ax.set_xticks(x_ticks)
-ax.set_xticklabels(x_labels)
-ax.set_xlim(x_ticks[0] - GROUP_W * 0.7, x_ticks[-1] + GROUP_W * 0.7)
-ax.set_ylabel("Out-of-sample profit")
-ax.yaxis.set_major_formatter(
-    mticker.FuncFormatter(lambda x, _: f"${x/1e3:.0f}k"))
-ax.grid(axis="y", linestyle="--")
+ # ── Axes ─────────────────────────────────────────────────────────────────────
+ ax.set_xticks(x_ticks)
+ ax.set_xticklabels(x_labels)
+ ax.set_xlim(x_ticks[0] - GROUP_W * 0.7, x_ticks[-1] + GROUP_W * 0.7)
+ ax.set_ylabel("Out-of-sample profit")
+ ax.yaxis.set_major_formatter(
+     mticker.FuncFormatter(lambda x, _: f"${x/1e3:.0f}k"))
+ ax.grid(axis="y", linestyle="--")
 
-# ── Legend ────────────────────────────────────────────────────────────────────
-legend_patches = [
-    mpatches.Patch(color=NOM_LIGHT, alpha=0.7, label="Nominal $x$  (Scen. A)"),
-    mpatches.Patch(color=ROB_LIGHT, alpha=0.7, label="Robust $x$   (Scen. A)"),
-]
-legend_lines = [
-    mpatches.Patch(color=NOM_DARK,  alpha=0.85, label="CVaR$_{5\\%}$ tail — Nominal"),
-    mpatches.Patch(color=ROB_DARK,  alpha=0.85, label="CVaR$_{5\\%}$ tail — Robust"),
-    plt.Line2D([0],[0], color="gray",  lw=2.2, label="Median"),
-    plt.Line2D([0],[0], color="gray",  lw=1.2,
-               linestyle="--", label="5th percentile (VaR)"),
-    plt.Line2D([0],[0], marker="D", color="w",
-               markeredgecolor="gray", markersize=5, label="Mean"),
-]
-ax.legend(handles=legend_patches + legend_lines,
-          ncol=2, frameon=True, framealpha=0.92,
-          loc="upper right", fontsize=8.5,
-          edgecolor="0.8")
+ # ── Legend ────────────────────────────────────────────────────────────────────
+ legend_patches = [
+     mpatches.Patch(color=NOM_LIGHT, alpha=0.7, label="Nominal $x$  (Scen. A)"),
+     mpatches.Patch(color=ROB_LIGHT, alpha=0.7, label="Robust $x$   (Scen. A)"),
+ ]
+ legend_lines = [
+     mpatches.Patch(color=NOM_DARK,  alpha=0.85, label="CVaR$_{5\\%}$ tail — Nominal"),
+     mpatches.Patch(color=ROB_DARK,  alpha=0.85, label="CVaR$_{5\\%}$ tail — Robust"),
+     plt.Line2D([0],[0], color="gray",  lw=2.2, label="Median"),
+     plt.Line2D([0],[0], color="gray",  lw=1.2,
+                linestyle="--", label="5th percentile (VaR)"),
+     plt.Line2D([0],[0], marker="D", color="w",
+                markeredgecolor="gray", markersize=5, label="Mean"),
+ ]
+ ax.legend(handles=legend_patches + legend_lines,
+           ncol=2, frameon=True, framealpha=0.92,
+           loc="upper right", fontsize=8.5,
+           edgecolor="0.8")
 
-# ── Subtitle with parameters ──────────────────────────────────────────────────
-ax.set_title(
-    f"OOS Profit Distributions — Nominal vs. Robust  "
-    f"($v = {V_SCALE},\\; w = {W_VAL}$, adaptive pricing)",
-    fontsize=11, pad=8)
+ # ── Subtitle with parameters ──────────────────────────────────────────────────
+ ax.set_title(
+     f"OOS Profit Distributions — Nominal vs. Robust  "
+     f"($v = {V_SCALE},\\; w = {W_VAL}$, adaptive pricing)",
+     fontsize=11, pad=8)
 
-# ── Print CVaR summary ────────────────────────────────────────────────────────
-print(f"\n{'Γ':>4}  {'CVaR5 Nom':>12}  {'CVaR5 Rob':>12}  {'Δ CVaR5':>12}")
-print("-" * 46)
-for gam, (cn, cr) in cvar_summary.items():
-    print(f"{gam:>4}  {cn:>12,.0f}  {cr:>12,.0f}  {cr-cn:>+12,.0f}")
+ # ── Print CVaR summary ────────────────────────────────────────────────────────
+ print(f"\n{'Γ':>4}  {'CVaR5 Nom':>12}  {'CVaR5 Rob':>12}  {'Δ CVaR5':>12}")
+ print("-" * 46)
+ for gam, (cn, cr) in cvar_summary.items():
+     print(f"{gam:>4}  {cn:>12,.0f}  {cr:>12,.0f}  {cr-cn:>+12,.0f}")
 
-fig.tight_layout()
-fig.savefig("fig_violin_cvar.pdf", bbox_inches="tight")
-fig.savefig("fig_violin_cvar.png", dpi=300, bbox_inches="tight")
-print("\nSaved fig_violin_cvar.pdf / .png")
-plt.show()
+ fig.tight_layout()
+ fig.savefig("fig_violin_cvar.pdf", bbox_inches="tight")
+ fig.savefig("fig_violin_cvar.png", dpi=300, bbox_inches="tight")
+ print("\nSaved fig_violin_cvar.pdf / .png")
+ plt.show()
