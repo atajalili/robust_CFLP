@@ -34,7 +34,7 @@ mpl.rcParams.update({
     "grid.alpha":        0.3,
 })
 
-EXCEL = "/root/.claude/uploads/6ba662e2-d046-4036-9d5e-25bc2d3887f1/a8166f9f-05_sensitivity_results.xlsx"
+EXCEL = "05_sensitivity_results.xlsx"   # default; override before importing or in __main__
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 NOM_LIGHT  = "#6baed6"   # light blue
