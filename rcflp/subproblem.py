@@ -185,7 +185,26 @@ def solve_subproblem_dual(
 
     d.optimize()
 
-    obj_val = d.ObjVal
+    if d.SolCount == 0:
+        raise RuntimeError(
+            f"Subproblem found no feasible solution (Status={d.Status})."
+        )
+
+    if d.Status == GRB.OPTIMAL:
+        # Proven optimal: ObjVal is the exact maximum.
+        obj_val = d.ObjVal
+    else:
+        # Time limit or other early termination.
+        # d.ObjVal  = best incumbent  ≤ true max  (underestimates adversary)
+        # d.ObjBound = MIP bound      ≥ true max  (valid upper bound on adversary)
+        #
+        # For CCG's UB update (UB = min(UB, sub_obj + fixed)), we need
+        # sub_obj ≥ true max so the UB remains a valid upper bound and
+        # false convergence is prevented.  Use ObjBound here.
+        # The epsilon scenario returned is the best incumbent (a valid
+        # but possibly non-worst-case adversary) — the master problem
+        # still gets a useful scenario to cut against.
+        obj_val = d.ObjBound
 
     if not return_duals:
         # Return the single best scenario found
