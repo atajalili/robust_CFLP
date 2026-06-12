@@ -153,7 +153,13 @@ def _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn):
 
 
 def _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V):
-    """Inject MIP start hints from a prior solution (all variables)."""
+    """Inject MIP start hints from a prior solution (all variables).
+
+    Routes are permuted into descending clinic-count order to satisfy the
+    symmetry-breaking constraints  sum_i y[i,r] >= sum_i y[i,r+1].
+    Without this, the SA solution (which doesn't enforce ordering) violates
+    those constraints and the entire MIP start is rejected by Gurobi.
+    """
     ws_x = warm_start[0]   # {(i,j,r): 1}
     ws_L = warm_start[1]   # {r: L_r}
     ws_T = warm_start[2]   # {(i,r): T_ir}
@@ -161,11 +167,23 @@ def _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V):
     ws_z = warm_start[4]   # {r: z_r}
     ws_H = warm_start[5]   # {r: H_r}
 
+    # ── Sort routes by descending clinic count to satisfy symmetry-breaking ──
+    clinic_counts = {r: sum(1 for i in C if ws_y.get((i,r), 0) > 0.5) for r in R}
+    sorted_rs  = sorted(R, key=lambda r: -clinic_counts[r])
+    R_list     = list(R)
+    perm       = {sorted_rs[k]: R_list[k] for k in range(len(R_list))}
+
+    ws_x = {(i, j, perm[r]): v for (i, j, r), v in ws_x.items()}
+    ws_L = {perm[r]: v          for r, v in ws_L.items()}
+    ws_T = {(i, perm[r]): v     for (i, r), v in ws_T.items()}
+    ws_y = {(i, perm[r]): v     for (i, r), v in ws_y.items()}
+    ws_z = {perm[r]: v          for r, v in ws_z.items()}
+    ws_H = {perm[r]: v          for r, v in ws_H.items()}
+
     x, y, L, H, T = vd['x'], vd['y'], vd['L'], vd['H'], vd['T']
     eta, theta, beta, D, U, q = (vd['eta'], vd['theta'], vd['beta'],
                                   vd['D'], vd['U'], vd['q'])
 
-    # Derived warm-start values
     ws_y_bin = {(i,r): float(ws_y.get((i,r), 0) > 0.5) for i in C for r in R}
     ws_eta   = {(i,r): ws_y_bin[i,r] * ws_H.get(r, 0)  for i in C for r in R}
     ws_U     = {(i,r): ws_L.get(r, 0) - ws_T.get((i,r), 0) for i in C for r in R}
