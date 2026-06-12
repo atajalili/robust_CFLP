@@ -324,13 +324,13 @@ def branch_and_cut_solver(
 
     cut_counter = [0]   # mutable counter accessible inside closure
 
-    def _callback(where):
+    def _callback(model, where):
         if where != GRB.Callback.MIPSOL:
             return
 
-        D_v    = m.cbGetSolution([D[r]    for r in R])
-        H_v    = m.cbGetSolution([H[r]    for r in R])
-        beta_v = m.cbGetSolution([beta[r] for r in R])
+        D_v    = model.cbGetSolution([D[r]    for r in R])
+        H_v    = model.cbGetSolution([H[r]    for r in R])
+        beta_v = model.cbGetSolution([beta[r] for r in R])
 
         for idx, r in enumerate(R):
             H_r = H_v[idx];  D_r = D_v[idx];  b_r = beta_v[idx]
@@ -340,7 +340,7 @@ def branch_and_cut_solver(
             if f_r - b_r > tol:
                 slope = 2.0 * D_r / H_r
                 curv  = (D_r / H_r) ** 2
-                m.cbLazy(beta[r] >= slope*D[r] - curv*H[r])
+                model.cbLazy(beta[r] >= slope*D[r] - curv*H[r])
                 cut_counter[0] += 1
 
     if verbose:
