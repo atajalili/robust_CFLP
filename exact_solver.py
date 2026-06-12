@@ -302,9 +302,6 @@ def warm_start_solver(
         _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V)
         if verbose:
             print(f"  Warm-start loaded (SA obj = {warm_start[7]:.4f})")
-        # Good incumbent available — focus on proving optimality, skip heuristics
-        m.Params.MIPFocus   = 3
-        m.Params.Heuristics = 0.0
 
     m.Params.TimeLimit = time_limit
     m.Params.MIPGap    = mip_gap
