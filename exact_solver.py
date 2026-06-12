@@ -171,7 +171,8 @@ def _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V):
     ws_U     = {(i,r): ws_L.get(r, 0) - ws_T.get((i,r), 0) for i in C for r in R}
     ws_theta = {(i,r): ws_y_bin[i,r] * ws_U[i,r]           for i in C for r in R}
     ws_D     = {r: sum(demand[i] * ws_eta[i,r] for i in C) for r in R}
-    ws_beta  = {r: (ws_D[r]**2 / ws_H[r] if ws_H.get(r, 0) > 1e-8 else 0.0)
+    # Add a small slack so D²≤H·β is strictly satisfied in the MIP start check
+    ws_beta  = {r: (ws_D[r]**2 / ws_H[r] * (1.0 + 1e-6) if ws_H.get(r, 0) > 1e-8 else 0.0)
                 for r in R}
     ws_q     = {(i,r): demand[i] * ws_eta[i,r] + ws_y_bin[i,r]
                 for i in C for r in R}
@@ -301,7 +302,7 @@ def warm_start_solver(
         _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V)
         if verbose:
             print(f"  Warm-start loaded (SA obj = {warm_start[7]:.4f})")
-        # Good incumbent already in hand — focus on proving optimality
+        # Good incumbent available — focus on proving optimality, skip heuristics
         m.Params.MIPFocus   = 3
         m.Params.Heuristics = 0.0
 
@@ -314,6 +315,12 @@ def warm_start_solver(
     m.optimize()
 
     solve_time = time.time() - start_time
+
+    if verbose and warm_start is not None:
+        # Report whether Gurobi actually used the MIP start
+        # (look for "MIP start 1 is feasible" in the log above)
+        print(f"  MIP starts used: {m.SolCount}  "
+              f"(start accepted if log shows 'MIP start 1 is feasible')")
 
     if m.SolCount == 0:
         raise RuntimeError("warm_start_solver found no feasible solution.")
