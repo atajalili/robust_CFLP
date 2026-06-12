@@ -1,28 +1,30 @@
 """
-exact_solver.py — Two tools for the HIV EID VRP
-================================================
+exact_solver.py
+===============
 
-1. lp_lower_bound()
-   -----------------
-   Solves the continuous LP/SOCP relaxation (all binary/integer variables
-   relaxed to continuous).  Runs in < 1 second and returns a valid lower
-   bound on the optimal objective.  Use this to score SA solution quality.
+1. fast_lower_bound()
+   -------------------
+   Runs the full MIQCP (SOC kept) with a short time limit.
+   Returns Gurobi's dual bound (m.ObjBound) — valid even when the solve
+   is cut off early.  Tight in seconds because the SOC tightens the LP
+   relaxation just as in the full solve.
 
-2. branch_and_cut_solver()
-   ------------------------
-   Exact branch-and-cut solver.  The rotated SOC  D[r]² ≤ H[r]·β[r]  is
-   handled by Gurobi *lazy-cut callbacks*: OA cuts are injected into the
-   B&B tree the moment an integer node violates the SOC, rather than
-   re-solving the full MILP from scratch after every cut (the iterative
-   L-shaped approach).  This keeps one single B&B tree alive throughout,
-   letting Gurobi reuse its incumbent, dual bounds, and branching history.
+2. warm_start_solver()
+   --------------------
+   Full MIQCP solver (identical to gurobi_solver) with an optional
+   warm-start from any prior solution (e.g. SA).  The warm-start:
+     (a) Seeds a good initial incumbent → Gurobi prunes the B&B tree
+         more aggressively from the first node.
+     (b) Tightens the MIP gap tolerance from the incumbent side,
+         so optimality is proved faster.
+   Reports LB, UB, gap and solution time.
 
-   Optionally accepts a warm-start solution (e.g. from the SA) to:
-     (a) seed an initial incumbent,
-     (b) add OA cuts at the warm-start point before the first solve,
-         immediately tightening the LP relaxation.
-
-Both functions return the same 14-element list as gurobi_solver().
+Why not the iterative L-shaped / lazy-cut approach?
+   Removing the SOC from the master weakens the LP bound drastically
+   (e.g. 0.8 vs optimal 80.5), forcing tens of thousands of B&B nodes.
+   The original MIQCP keeps the SOC in every LP relaxation node, which
+   is exactly what makes Gurobi fast.  The correct strategy is to keep
+   the SOC and reduce solve time via warm-starting.
 """
 
 import time
@@ -30,25 +32,10 @@ import gurobipy as gp
 from gurobipy import GRB
 
 
-# =============================================================================
-# Shared model builder (routing constraints, no SOC on β)
-# =============================================================================
-
-def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
-                  relax=False):
+def _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn):
     """
-    Build the routing MILP/LP with β[r] ≥ 0 (no SOC).
-
-    Parameters
-    ----------
-    relax : bool
-        If True, all binary / integer variables are relaxed to continuous
-        (for the LP lower bound).
-
-    Returns
-    -------
-    m, vars_dict
-        Gurobi model and a dict of the key variable objects.
+    Build the full MIQCP (with SOC) — identical to gurobi_solver but
+    returns the model and variable dict for external use.
     """
     rho        = sum(demand[c] for c in C) / (K * mu)
     coeff_beta = 1.0 / (2.0 * K * K * mu * mu * (1.0 - rho))
@@ -56,18 +43,15 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
     m = gp.Model()
     m.Params.OutputFlag = 0
 
-    vtype_b = 'C' if relax else 'B'
-    vtype_i = 'C' if relax else GRB.INTEGER
-
-    x    = m.addVars(N, N, R, vtype=vtype_b, lb=0, ub=1)
-    y    = m.addVars(C, R,    vtype=vtype_b, lb=0, ub=1)
+    x     = m.addVars(N, N, R, vtype='B')
+    y     = m.addVars(C, R,    vtype='B')
 
     if mode == "Single":
         z_var = None
         z     = [1] * Rn
     elif mode == "Multiple":
-        z_var = m.addVars(R, vtype=vtype_i, lb=0, ub=max(V))
-        zeta  = m.addVars(R, V, vtype=vtype_b, lb=0, ub=1)
+        z_var = m.addVars(R, vtype=GRB.INTEGER, lb=0)
+        zeta  = m.addVars(R, V, vtype='B')
         delta = m.addVars(R, V, vtype='C', lb=0)
         z     = z_var
 
@@ -79,7 +63,7 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
     T     = m.addVars(N, R, vtype='C', lb=0)
     eta   = m.addVars(C, R, vtype='C', lb=0)
     theta = m.addVars(C, R, vtype='C')
-    beta  = m.addVars(R, vtype='C', lb=0)   # no SOC yet
+    beta  = m.addVars(R, vtype='C', lb=0)
 
     TLT     = m.addVars(C, vtype='C', lb=0)
     max_L   = m.addVar(vtype='C', lb=0)
@@ -116,22 +100,11 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
                         gp.quicksum(x[j,i,r] for j in N))
             m.addConstr(y[i,r] == gp.quicksum(x[i,j,r] for j in N))
             m.addConstr(q[i,r] == demand[i]*eta[i,r] + y[i,r])
+            m.addConstr((y[i,r]==1) >> (eta[i,r]   == H[r]))
+            m.addConstr((y[i,r]==0) >> (eta[i,r]   == 0))
             m.addConstr(U[i,r] == L[r] - T[i,r])
-            if relax:
-                # Big-M linearisation for LP (indicator constraints not valid
-                # in LP mode; use explicit McCormick-style bounds instead)
-                M_H = sum(t[i,j] for i in N for j in N) + 1
-                m.addConstr(eta[i,r]   <= H[r])
-                m.addConstr(eta[i,r]   <= M_H * y[i,r])
-                m.addConstr(eta[i,r]   >= H[r] - M_H*(1 - y[i,r]))
-                m.addConstr(theta[i,r] <= U[i,r])
-                m.addConstr(theta[i,r] <= M_H * y[i,r])
-                m.addConstr(theta[i,r] >= U[i,r] - M_H*(1 - y[i,r]))
-            else:
-                m.addConstr((y[i,r]==1) >> (eta[i,r]   == H[r]))
-                m.addConstr((y[i,r]==0) >> (eta[i,r]   == 0))
-                m.addConstr((y[i,r]==1) >> (theta[i,r] == U[i,r]))
-                m.addConstr((y[i,r]==0) >> (theta[i,r] == 0))
+            m.addConstr((y[i,r]==1) >> (theta[i,r] == U[i,r]))
+            m.addConstr((y[i,r]==0) >> (theta[i,r] == 0))
 
     for r in R:
         m.addConstr(gp.quicksum(x[0,j,r]    for j in N if j != 0)    == 1)
@@ -145,14 +118,8 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
             m.addConstr(gp.quicksum(zeta[r,v] for v in V) <= 1)
             m.addConstr(L[r] == gp.quicksum(v*delta[r,v] for v in V))
             for v in V:
-                if relax:
-                    M_H = sum(t[i,j] for i in N for j in N) + 1
-                    m.addConstr(delta[r,v] <= H[r])
-                    m.addConstr(delta[r,v] <= M_H * zeta[r,v])
-                    m.addConstr(delta[r,v] >= H[r] - M_H*(1 - zeta[r,v]))
-                else:
-                    m.addConstr((zeta[r,v]==1) >> (delta[r,v] == H[r]))
-                    m.addConstr((zeta[r,v]==0) >> (delta[r,v] == 0))
+                m.addConstr((zeta[r,v]==1) >> (delta[r,v] == H[r]))
+                m.addConstr((zeta[r,v]==0) >> (delta[r,v] == 0))
 
         m.addConstr(gp.quicksum(q[i,r] for i in C) <= Q)
         m.addConstr(T[0,r]    == 0)
@@ -165,15 +132,10 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
         for i in N:
             m.addConstr(x[i,i,r] == 0)
             for j in N:
-                if relax:
-                    M_T = sum(t[i,j] for i in N for j in N) + 1
-                    m.addConstr(T[i,r] + t[i,j] - T[j,r] <= M_T*(1 - x[i,j,r]))
-                else:
-                    m.addConstr((x[i,j,r]==1) >> (T[i,r] + t[i,j] - T[j,r] == 0))
+                m.addConstr((x[i,j,r]==1) >> (T[i,r] + t[i,j] - T[j,r] == 0))
 
-        # SOC as actual constraint for LP relaxation (SOCP → still convex)
-        if relax:
-            m.addQConstr(D[r]*D[r] <= H[r]*beta[r])
+        # SOC — kept as a proper constraint (critical for tight LP relaxation)
+        m.addQConstr(D[r]*D[r] <= H[r]*beta[r])
 
     m.addConstr(gp.quicksum(z[r] for r in R) <= Vn)
 
@@ -190,253 +152,201 @@ def _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
     return m, vd
 
 
+def _set_warm_start(m, vd, warm_start, C, N, R, mode):
+    """Inject MIP start hints from a prior solution."""
+    ws_x   = warm_start[0]   # {(i,j,r): 1}
+    ws_L   = warm_start[1]   # {r: L_r}
+    ws_T   = warm_start[2]   # {(i,r): T_ir}
+    ws_y   = warm_start[3]   # {(i,r): 0/1}
+    ws_z   = warm_start[4]   # {r: z_r}
+    ws_H   = warm_start[5]   # {r: H_r}
+
+    x, y, L, H, T = vd['x'], vd['y'], vd['L'], vd['H'], vd['T']
+    eta, theta, beta, D = vd['eta'], vd['theta'], vd['beta'], vd['D']
+
+    ws_eta = {(i,r): ws_y.get((i,r),0) * ws_H.get(r,0) for i in C for r in R}
+    ws_D   = {r: sum(warm_start[3].get((i,r),0) * ws_H.get(r,0) * 1
+                     for i in C)   # approximate; exact D set via eta
+              for r in R}
+
+    for (i,j,r) in x.keys():
+        x[i,j,r].Start = float(ws_x.get((i,j,r), 0))
+    for (i,r) in y.keys():
+        y[i,r].Start = float(ws_y.get((i,r), 0) > 0.5)
+    for r in R:
+        L[r].Start = float(ws_L.get(r, 0))
+        H[r].Start = float(ws_H.get(r, 0))
+    for (i,r) in vd['T'].keys():
+        T[i,r].Start = float(ws_T.get((i,r), 0))
+    for (i,r) in eta.keys():
+        eta[i,r].Start = float(ws_eta.get((i,r), 0))
+
+    if mode == "Multiple" and vd['z'] is not None:
+        for r in R:
+            vd['z'][r].Start = float(ws_z.get(r, 1))
+
+
 # =============================================================================
-# 1. LP / SOCP lower bound
+# 1. Fast lower bound  (short-time-limit MIQCP)
 # =============================================================================
 
-def lp_lower_bound(
+def fast_lower_bound(
     obj, mode,
     C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
+    warm_start = None,
     time_limit = 30,
     verbose    = False,
 ):
     """
-    Solve the continuous LP/SOCP relaxation to get a fast valid lower bound.
+    Run the full MIQCP with a short time limit and return Gurobi's dual
+    bound (m.ObjBound) as a valid lower bound.
 
-    All binary and integer variables are relaxed to [0,1] / [0, max(V)].
-    The SOC  D[r]²  ≤  H[r]·β[r]  is kept as a convex constraint, so the
-    relaxation is a SOCP (solved in milliseconds by Gurobi).
+    The SOC constraint is kept — this is what makes the LP relaxation
+    tight, giving a useful bound even after just a few seconds.
+
+    Parameters
+    ----------
+    warm_start : list, optional
+        Prior solution (SA / any solver) used to seed a good incumbent,
+        which tightens the bound faster.
+    time_limit : float
+        Seconds to run.  30 s is usually enough for a useful LB.
 
     Returns
     -------
-    lb : float
-        Valid lower bound on the optimal objective.
-    solve_time : float
-        Wall-clock solve time in seconds.
+    lb         : float  — valid lower bound on the optimal objective
+    solve_time : float  — wall-clock seconds used
     """
     t0 = time.time()
-    m, vd = _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu,
-                           SCV, Cn, Vn, Rn, relax=True)
+    m, vd = _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu,
+                          SCV, Cn, Vn, Rn)
+    if warm_start is not None:
+        _set_warm_start(m, vd, warm_start, C, N, R, mode)
+
     if verbose:
         m.Params.OutputFlag = 1
+
     m.Params.TimeLimit = time_limit
+    m.update()
     m.optimize()
 
     solve_time = time.time() - t0
+    lb         = m.ObjBound if m.SolCount >= 0 else -float('inf')
+    ub         = m.ObjVal   if m.SolCount >  0 else  float('inf')
 
-    if m.SolCount == 0:
-        return -float('inf'), solve_time
-
-    lb = m.ObjVal
-    if verbose:
-        print(f"  LP lower bound: {lb:.4f}  (solved in {solve_time:.2f}s)")
+    if verbose or True:
+        print(f"  fast_lower_bound | LB={lb:.4f}  "
+              f"UB={ub:.4f}  time={solve_time:.1f}s")
     return lb, solve_time
 
 
 # =============================================================================
-# 2. Branch-and-cut with lazy OA callbacks
+# 2. Warm-start exact solver
 # =============================================================================
 
-def branch_and_cut_solver(
+def warm_start_solver(
     obj, mode,
     C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn,
-    warm_start  = None,    # result list from SA / any prior solver
-    time_limit  = 300,
-    tol         = 1e-4,
-    verbose     = True,
+    warm_start = None,
+    time_limit = 300,
+    mip_gap    = 1e-4,
+    verbose    = True,
 ):
     """
-    Exact branch-and-cut solver using Gurobi lazy-cut callbacks.
+    Full MIQCP solver (identical model to gurobi_solver) with optional
+    warm-start from any prior solution.
 
-    The SOC  D[r]² ≤ H[r]·β[r]  is enforced by injecting OA cuts
-    *inside the running B&B tree* every time Gurobi finds an integer node
-    that violates the SOC — no separate MILP re-solve needed.
-
-    Compared with the iterative L-shaped:
-      • One B&B tree lives throughout (Gurobi reuses bounds/heuristics).
-      • Cuts are added exactly where violations occur.
-      • Warm-start + initial cuts tighten the LP relaxation immediately.
+    The warm-start seeds Gurobi's MIP start with the SA (or any heuristic)
+    solution, immediately providing a tight incumbent.  Gurobi then only
+    needs to prove optimality, not discover the solution from scratch.
 
     Parameters
     ----------
-    warm_start : list or None
-        14-element result list (e.g. from metaheuristic_solver).
-        Used to seed an MIP start and add pre-emptive OA cuts.
+    warm_start : list, optional
+        14-element result list from metaheuristic_solver / gurobi_solver.
+    mip_gap    : float
+        Relative MIP gap tolerance (default 0.01%).
+
+    Returns
+    -------
+    Standard 14-element list (same as gurobi_solver).
     """
     start_time = time.time()
     rho        = sum(demand[c] for c in C) / (K * mu)
     coeff_beta = 1.0 / (2.0 * K * K * mu * mu * (1.0 - rho))
 
-    m, vd = _build_master(obj, mode, C, N, R, t, demand, Q, V, K, mu,
-                           SCV, Cn, Vn, Rn, relax=False)
+    m, vd = _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu,
+                          SCV, Cn, Vn, Rn)
 
-    x, y, L, H, D, T = vd['x'], vd['y'], vd['L'], vd['H'], vd['D'], vd['T']
-    eta, theta, beta  = vd['eta'], vd['theta'], vd['beta']
-    max_TLT           = vd['max_TLT']
-    z_var             = vd['z']
-
-    # ── Pre-emptive OA cuts + MIP warm-start from external solution ──────────
     if warm_start is not None:
-        ws_H   = warm_start[5]   # time_between_visits {r: H_r}
-        ws_y   = warm_start[3]   # allocations {(i,r): 0/1}
-        ws_L   = warm_start[1]   # lengthes {r: L_r}
-        ws_sol = warm_start[0]   # solution {(i,j,r): 1}
-        ws_z   = warm_start[4]   # num_vehicles {r: z_r}
-        ws_T   = warm_start[2]   # start_times {(i,r): T_ir}
-        ws_eta = {(i,r): ws_y.get((i,r),0)*ws_H.get(r,0) for i in C for r in R}
-
-        # Compute D* from warm-start
-        ws_D = {r: sum(demand[i]*ws_eta[i,r] for i in C) for r in R}
-
-        n_pre = 0
-        for r in R:
-            H_r = ws_H.get(r, 0.0)
-            D_r = ws_D[r]
-            if H_r > 1e-8:
-                slope = 2.0 * D_r / H_r
-                curv  = (D_r / H_r) ** 2
-                m.addConstr(beta[r] >= slope*D[r] - curv*H[r],
-                            name=f"oa_ws_r{r}")
-                n_pre += 1
-
-        # MIP start hints
-        for (i,j,r), val in ws_sol.items():
-            x[i,j,r].Start = float(val)
-        for (i,r), val in ws_y.items():
-            y[i,r].Start = float(val > 0.5)
-        for r in R:
-            L[r].Start = ws_L.get(r, 0.0)
-            H[r].Start = ws_H.get(r, 0.0)
-            D[r].Start = ws_D[r]
-        for (i,r), val in ws_T.items():
-            if i in [nd for nd in N]:
-                T[i,r].Start = float(val)
-        if mode == "Multiple" and z_var is not None:
-            for r in R:
-                z_var[r].Start = float(ws_z.get(r, 1))
-
+        _set_warm_start(m, vd, warm_start, C, N, R, mode)
         if verbose:
-            print(f"  Warm-start loaded | {n_pre} pre-emptive OA cuts added.")
+            print(f"  Warm-start loaded (SA obj = {warm_start[7]:.4f})")
 
-    # ── Lazy-cut callback ────────────────────────────────────────────────────
-    m.Params.LazyConstraints = 1
-    m.Params.TimeLimit        = time_limit
-
-    cut_counter = [0]   # mutable counter accessible inside closure
-
-    def _callback(model, where):
-        if where != GRB.Callback.MIPSOL:
-            return
-
-        D_v    = model.cbGetSolution([D[r]    for r in R])
-        H_v    = model.cbGetSolution([H[r]    for r in R])
-        beta_v = model.cbGetSolution([beta[r] for r in R])
-
-        for idx, r in enumerate(R):
-            H_r = H_v[idx];  D_r = D_v[idx];  b_r = beta_v[idx]
-            if H_r < 1e-8:
-                continue
-            f_r = D_r * D_r / H_r
-            if f_r - b_r > tol:
-                slope = 2.0 * D_r / H_r
-                curv  = (D_r / H_r) ** 2
-                model.cbLazy(beta[r] >= slope*D[r] - curv*H[r])
-                cut_counter[0] += 1
-
+    m.Params.TimeLimit = time_limit
+    m.Params.MIPGap    = mip_gap
     if verbose:
         m.Params.OutputFlag = 1
-        print(f"\n{'─'*65}")
-        print(f"  BRANCH-AND-CUT  |  obj={obj}  mode={mode}  "
-              f"Cn={Cn}  Rn={Rn}  Vn={Vn}")
-        print(f"  ρ={rho:.4f}   K={K}   μ={mu}   SCV={SCV}")
-        print(f"{'─'*65}")
 
-    m.optimize(_callback)
+    m.update()
+    m.optimize()
 
     solve_time = time.time() - start_time
 
     if m.SolCount == 0:
-        raise RuntimeError(
-            "Branch-and-cut found no feasible solution.\n"
-            "Try increasing time_limit or check instance parameters."
-        )
+        raise RuntimeError("warm_start_solver found no feasible solution.")
 
-    # ── Extract best solution ────────────────────────────────────────────────
+    x, y, L, H, D = vd['x'], vd['y'], vd['L'], vd['H'], vd['D']
+    T, eta, theta, beta = vd['T'], vd['eta'], vd['theta'], vd['beta']
+    z_var = vd['z']
+
     L_val   = {r: L[r].x    for r in R}
     H_val   = {r: H[r].x    for r in R}
-    D_val   = {r: D[r].x    for r in R}
     eta_val = {(i,r): eta[i,r].x   for i in C for r in R}
     tht_val = {(i,r): theta[i,r].x for i in C for r in R}
 
-    # Compute exact W_lab from recovered solution
-    phi_actual = sum(D_val[r]**2 / H_val[r] for r in R if H_val[r] > 1e-8)
+    phi_actual = sum(D[r].x**2 / H_val[r] for r in R if H_val[r] > 1e-8)
     W_lab = ((K-1)/(2*K*mu*rho)
              + phi_actual * coeff_beta
              + SCV*rho/(2*mu*(1-rho))
              + 1.0/mu)
 
-    TATs = {i: sum(0.5*eta_val[i,r] + tht_val[i,r] for r in R) + W_lab
-            for i in C}
-
-    TRL  = sum(L_val.values())
-    MRL  = max(L_val.values())
-    ATAT = sum(TATs.values()) / Cn
-    MTAT = max(TATs.values())
-
-    # Use actual objective (SOC satisfied by cuts → ObjVal ≈ true obj)
-    if obj in ("ATAT_Min", "MTAT_Min"):
-        obj_val = ATAT if obj == "ATAT_Min" else MTAT
-    else:
-        obj_val = m.ObjVal
-
-    LB  = m.ObjBound
-    gap = abs(obj_val - LB) / abs(obj_val) * 100 if obj_val != 0 else 0.0
+    TATs  = {i: sum(0.5*eta_val[i,r] + tht_val[i,r] for r in R) + W_lab
+             for i in C}
+    TRL   = sum(L_val.values())
+    MRL   = max(L_val.values())
+    ATAT  = sum(TATs.values()) / Cn
+    MTAT  = max(TATs.values())
+    LB    = m.ObjBound
+    UB    = ATAT if obj == "ATAT_Min" else MTAT if obj == "MTAT_Min" else m.ObjVal
+    gap   = abs(UB - LB) / abs(UB) * 100 if UB != 0 else 0.0
 
     if verbose:
-        print(f"\n{'='*65}")
-        print(f"  B&C RESULT   obj={obj}  mode={mode}")
-        print(f"  Objective      : {obj_val:.4f}")
-        print(f"  Lower bound    : {LB:.4f}")
-        print(f"  Gap            : {gap:.4f}%")
-        print(f"  ATAT           : {ATAT:.4f}")
-        print(f"  MTAT           : {MTAT:.4f}")
-        print(f"  TRL            : {TRL:.4f}")
-        print(f"  MRL            : {MRL:.4f}")
-        print(f"  W_lab          : {W_lab:.4f}")
-        print(f"  Lazy OA cuts   : {cut_counter[0]}")
-        print(f"  Time           : {solve_time:.2f}s")
-        print(f"  B&B nodes      : {int(m.NodeCount)}")
-        print(f"{'='*65}")
+        print(f"\n{'='*60}")
+        print(f"  WARM-START SOLVER  obj={obj}  mode={mode}")
+        print(f"  Objective  : {UB:.4f}")
+        print(f"  Lower bound: {LB:.4f}   Gap: {gap:.4f}%")
+        print(f"  ATAT       : {ATAT:.4f}   MTAT: {MTAT:.4f}")
+        print(f"  W_lab      : {W_lab:.4f}")
+        print(f"  Time       : {solve_time:.2f}s   Nodes: {int(m.NodeCount)}")
+        print(f"{'='*60}")
 
-    solution   = {(i,j,r): 1 for (i,j,r) in x.keys() if x[i,j,r].x > 0.5}
-    start_times= {(i,r): T[i,r].x for i in N for r in R}
-    allocations= {(i,r): y[i,r].x for i in C for r in R}
-    num_veh    = ({r: z_var[r].x for r in R} if mode=="Multiple"
-                  else {r: 1 for r in R})
+    solution    = {(i,j,r): 1 for (i,j,r) in x.keys() if x[i,j,r].x > 0.5}
+    start_times = {(i,r): T[i,r].x for i in N for r in R}
+    allocations = {(i,r): y[i,r].x for i in C for r in R}
+    num_veh     = ({r: z_var[r].x for r in R} if mode == "Multiple"
+                   else {r: 1 for r in R})
 
     diagnostics = {
-        "LB":              LB,
-        "UB":              obj_val,
-        "gap_pct":         gap,
-        "n_lazy_cuts":     cut_counter[0],
-        "n_bb_nodes":      int(m.NodeCount),
-        "solution_time":   solve_time,
-        "gurobi_status":   m.Status,
+        "LB": LB, "UB": UB, "gap_pct": gap,
+        "n_bb_nodes": int(m.NodeCount),
+        "solution_time": solve_time,
+        "gurobi_status": m.Status,
+        "warm_started": warm_start is not None,
     }
 
     return [
-        solution,     # 0
-        L_val,        # 1
-        start_times,  # 2
-        allocations,  # 3
-        num_veh,      # 4
-        H_val,        # 5
-        TATs,         # 6
-        obj_val,      # 7
-        solve_time,   # 8
-        TRL,          # 9
-        MRL,          # 10
-        ATAT,         # 11
-        MTAT,         # 12
-        diagnostics,  # 13
+        solution, L_val, start_times, allocations, num_veh,
+        H_val, TATs, UB, solve_time, TRL, MRL, ATAT, MTAT,
+        diagnostics,
     ]
