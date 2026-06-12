@@ -152,38 +152,57 @@ def _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu, SCV, Cn, Vn, Rn):
     return m, vd
 
 
-def _set_warm_start(m, vd, warm_start, C, N, R, mode):
-    """Inject MIP start hints from a prior solution."""
-    ws_x   = warm_start[0]   # {(i,j,r): 1}
-    ws_L   = warm_start[1]   # {r: L_r}
-    ws_T   = warm_start[2]   # {(i,r): T_ir}
-    ws_y   = warm_start[3]   # {(i,r): 0/1}
-    ws_z   = warm_start[4]   # {r: z_r}
-    ws_H   = warm_start[5]   # {r: H_r}
+def _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V):
+    """Inject MIP start hints from a prior solution (all variables)."""
+    ws_x = warm_start[0]   # {(i,j,r): 1}
+    ws_L = warm_start[1]   # {r: L_r}
+    ws_T = warm_start[2]   # {(i,r): T_ir}
+    ws_y = warm_start[3]   # {(i,r): 0/1}
+    ws_z = warm_start[4]   # {r: z_r}
+    ws_H = warm_start[5]   # {r: H_r}
 
     x, y, L, H, T = vd['x'], vd['y'], vd['L'], vd['H'], vd['T']
-    eta, theta, beta, D = vd['eta'], vd['theta'], vd['beta'], vd['D']
+    eta, theta, beta, D, U, q = (vd['eta'], vd['theta'], vd['beta'],
+                                  vd['D'], vd['U'], vd['q'])
 
-    ws_eta = {(i,r): ws_y.get((i,r),0) * ws_H.get(r,0) for i in C for r in R}
-    ws_D   = {r: sum(warm_start[3].get((i,r),0) * ws_H.get(r,0) * 1
-                     for i in C)   # approximate; exact D set via eta
-              for r in R}
+    # Derived warm-start values
+    ws_y_bin = {(i,r): float(ws_y.get((i,r), 0) > 0.5) for i in C for r in R}
+    ws_eta   = {(i,r): ws_y_bin[i,r] * ws_H.get(r, 0)  for i in C for r in R}
+    ws_U     = {(i,r): ws_L.get(r, 0) - ws_T.get((i,r), 0) for i in C for r in R}
+    ws_theta = {(i,r): ws_y_bin[i,r] * ws_U[i,r]           for i in C for r in R}
+    ws_D     = {r: sum(demand[i] * ws_eta[i,r] for i in C) for r in R}
+    ws_beta  = {r: (ws_D[r]**2 / ws_H[r] if ws_H.get(r, 0) > 1e-8 else 0.0)
+                for r in R}
+    ws_q     = {(i,r): demand[i] * ws_eta[i,r] + ws_y_bin[i,r]
+                for i in C for r in R}
 
     for (i,j,r) in x.keys():
         x[i,j,r].Start = float(ws_x.get((i,j,r), 0))
     for (i,r) in y.keys():
-        y[i,r].Start = float(ws_y.get((i,r), 0) > 0.5)
+        y[i,r].Start = ws_y_bin[i,r]
     for r in R:
         L[r].Start = float(ws_L.get(r, 0))
         H[r].Start = float(ws_H.get(r, 0))
-    for (i,r) in vd['T'].keys():
+        D[r].Start = ws_D[r]
+        beta[r].Start = ws_beta[r]
+    for (i,r) in T.keys():
         T[i,r].Start = float(ws_T.get((i,r), 0))
     for (i,r) in eta.keys():
-        eta[i,r].Start = float(ws_eta.get((i,r), 0))
+        eta[i,r].Start   = ws_eta[i,r]
+        theta[i,r].Start = ws_theta[i,r]
+        U[i,r].Start     = ws_U[i,r]
+        q[i,r].Start     = ws_q[i,r]
 
     if mode == "Multiple" and vd['z'] is not None:
+        zeta  = vd['zeta']
+        delta = vd['delta']
         for r in R:
-            vd['z'][r].Start = float(ws_z.get(r, 1))
+            z_val = int(round(ws_z.get(r, 1)))
+            vd['z'][r].Start = float(z_val)
+            for v in V:
+                zeta[r,v].Start  = float(v == z_val)
+                delta[r,v].Start = (float(ws_H.get(r, 0))
+                                    if v == z_val else 0.0)
 
 
 # =============================================================================
@@ -221,7 +240,7 @@ def fast_lower_bound(
     m, vd = _build_miqcp(obj, mode, C, N, R, t, demand, Q, V, K, mu,
                           SCV, Cn, Vn, Rn)
     if warm_start is not None:
-        _set_warm_start(m, vd, warm_start, C, N, R, mode)
+        _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V)
 
     if verbose:
         m.Params.OutputFlag = 1
@@ -279,9 +298,12 @@ def warm_start_solver(
                           SCV, Cn, Vn, Rn)
 
     if warm_start is not None:
-        _set_warm_start(m, vd, warm_start, C, N, R, mode)
+        _set_warm_start(m, vd, warm_start, C, N, R, mode, demand, V)
         if verbose:
             print(f"  Warm-start loaded (SA obj = {warm_start[7]:.4f})")
+        # Good incumbent already in hand — focus on proving optimality
+        m.Params.MIPFocus   = 3
+        m.Params.Heuristics = 0.0
 
     m.Params.TimeLimit = time_limit
     m.Params.MIPGap    = mip_gap
