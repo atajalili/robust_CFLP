@@ -1,0 +1,306 @@
+% ============================================================
+%  L-Shaped Outer-Approximation Algorithm for the HIV EID VRP
+%  Paste this into an Overleaf article / section.
+%  Required packages (add to preamble if not already present):
+%    \usepackage{amsmath,amssymb,amsthm}
+%    \usepackage{algorithm}
+%    \usepackage{algpseudocode}
+%    \usepackage{booktabs}
+%    \usepackage{xcolor}
+% ============================================================
+
+\section{Solution Algorithm: Outer-Approximation L-Shaped Method}
+\label{sec:algorithm}
+
+\subsection{Problem Structure and Motivation}
+
+The full objective for the Average (or Maximum) Turnaround-Time
+minimisation problem contains a nonlinear term arising from the
+laboratory queuing delay.  Specifically, the total expected waiting
+time at the laboratory (W_{\text{lab}}) can be decomposed as
+
+\begin{equation}
+  W_{\text{lab}}
+  \;=\;
+  \underbrace{%
+    \frac{K-1}{2K\mu\rho}
+    + \frac{SCV \cdot \rho}{2\mu(1-\rho)}
+    + \frac{1}{\mu}
+  }_{\text{constant (given }\rho\text{)}}
+  \;+\;
+  \underbrace{%
+    \frac{1}{2K^{2}\mu^{2}(1-\rho)}
+    \sum_{r \in \mathcal{R}} \frac{D_r^{2}}{H_r}
+  }_{\varphi:\;\text{route-dependent}},
+  \label{eq:wlab}
+\end{equation}
+
+where $\rho = \sum_{i\in\mathcal{C}} \lambda_i / (K\mu)$ is the
+laboratory utilisation (a constant once the clinic set is fixed),
+$D_r = H_r \sum_{i \in \mathcal{C}_r} \lambda_i$ is the total demand
+batched per vehicle visit on route $r$, and $H_r = L_r / z_r$ is the
+headway (time between successive vehicle visits to any point on route
+$r$).  The first three terms of \eqref{eq:wlab} are independent of the
+routing decisions once $\rho$ is known; only $\varphi$ depends on how
+clinics are assigned to routes and how many vehicles serve each route.
+
+The term $D_r^{2}/H_r$ enters the mixed-integer programme as a
+rotated second-order cone (SOC) constraint
+\begin{equation}
+  D_r^{2} \;\leq\; H_r \cdot \beta_r, \quad r \in \mathcal{R},
+  \label{eq:soc}
+\end{equation}
+with $\beta_r$ appearing in the objective.  This makes the master
+problem a Mixed-Integer Quadratically Constrained Programme (MIQCP),
+which is substantially harder to solve than a pure Mixed-Integer Linear
+Programme (MILP).  Furthermore, the nonconvex interaction between the
+binary clinic-assignment variables $y_{ir}$, the integer vehicle-count
+variables $z_r$, and the continuous headway $H_r$ leads to long
+solution times that grow rapidly with the number of clinics.
+
+\subsection{Outer-Approximation Reformulation}
+
+We exploit the fact that $f(D,H) = D^{2}/H$ is jointly convex in
+$(D,H)$ for $H > 0$.  Its epigraph can therefore be outer-approximated
+by a (potentially infinite) family of linear supporting hyperplanes.
+
+\begin{proposition}[Supporting hyperplane for $D^2/H$]
+\label{prop:oa}
+Let $(D^{*},H^{*})$ with $H^{*}>0$ be any reference point.  Then for
+all $(D,H)$ with $H>0$,
+\begin{equation}
+  \frac{D^{2}}{H}
+  \;\geq\;
+  \frac{2D^{*}}{H^{*}} \cdot D
+  \;-\;
+  \left(\frac{D^{*}}{H^{*}}\right)^{\!2} H.
+  \label{eq:oa_cut}
+\end{equation}
+The bound is tight at $(D,H)=(D^{*},H^{*})$.
+\end{proposition}
+
+\begin{proof}
+The gradient of $f$ at $(D^{*},H^{*})$ is
+$\nabla f = (2D^{*}/H^{*},\,-D^{*2}/H^{*2})$.
+Convexity of $f$ gives $f(D,H) \geq f(D^{*},H^{*}) + \nabla
+f^{\top}(D-D^{*},H-H^{*})$.  Expanding and simplifying yields
+\eqref{eq:oa_cut}. Tightness at the reference point follows by direct
+substitution.
+\end{proof}
+
+Replacing the SOC constraint \eqref{eq:soc} by an initially empty
+set of linear cuts of the form \eqref{eq:oa_cut}—added iteratively at
+successive master solutions—converts each master solve into a pure
+MILP while preserving the validity of the lower bound.
+
+\subsection{Master Problem}
+
+The master problem at iteration $k$ is:
+
+\begin{subequations}
+\label{eq:master}
+\begin{align}
+  \min \quad
+  & \underbrace{g(x,y,z,\eta,\theta)}_{\text{routing objective}}
+    + \frac{1}{2K^{2}\mu^{2}(1-\rho)}
+      \sum_{r\in\mathcal{R}} \beta_r
+    + \text{const}
+  \label{eq:master_obj}\\[4pt]
+  \text{s.t.} \quad
+  & \text{all routing constraints \eqref{eq:assign}--\eqref{eq:visit}},
+  \label{eq:master_routing}\\
+  & D_r = \sum_{i\in\mathcal{C}} \lambda_i \,\eta_{ir},
+    \quad r\in\mathcal{R},
+  \label{eq:master_D}\\
+  & \beta_r \geq 0,
+    \quad r\in\mathcal{R},
+  \label{eq:master_beta_lb}\\
+  & \beta_r \geq
+      \frac{2D_r^{(\ell)}}{H_r^{(\ell)}} D_r
+      - \left(\frac{D_r^{(\ell)}}{H_r^{(\ell)}}\right)^{\!2} H_r,
+    \quad r\in\mathcal{R},\;\ell=1,\dots,k-1.
+  \label{eq:master_cuts}
+\end{align}
+\end{subequations}
+
+Here $\eta_{ir} = y_{ir} H_r$ is the product of the binary
+clinic-assignment variable and the headway (linearised via the
+indicator constraints already present in the base formulation);
+$(D_r^{(\ell)}, H_r^{(\ell)})$ are the values of $(D_r, H_r)$
+extracted from the master solution at iteration $\ell$.  The routing
+objective $g$ equals $\frac{1}{|\mathcal{C}|}\sum_{i,r}
+(0.5\,\eta_{ir}+\theta_{ir})$ for \textsc{ATAT-Min} and $\max_{i}
+\text{TLT}_i$ for \textsc{MTAT-Min}.
+
+Because \eqref{eq:master_cuts} is a finite set of linear constraints,
+problem \eqref{eq:master} is a MILP at every iteration.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[t]
+\caption{Outer-Approximation L-Shaped Method for the EID-VRP}
+\label{alg:lshaped}
+\begin{algorithmic}[1]
+
+\State \textbf{Input:} instance data, objective \texttt{obj},
+       vehicle mode \texttt{mode}, tolerances $\epsilon_{\text{SOC}}$,
+       $\epsilon_{\text{gap}}$, time limit $T_{\max}$.
+
+\State Build master MILP \eqref{eq:master} with
+       $\mathcal{L} \leftarrow \emptyset$ (no OA cuts).
+\State $\overline{v} \leftarrow +\infty$ \;(best upper bound),\quad
+       $\underline{v} \leftarrow -\infty$ \;(best lower bound).
+
+\Repeat
+
+  \State Solve master \eqref{eq:master}; let
+         $(\bar{x},\bar{y},\bar{z},\bar{\eta},\bar{\theta},
+           \bar{D},\bar{H},\bar{\beta})$ be the incumbent.
+  \State $\underline{v} \leftarrow
+         \max\!\bigl(\underline{v},\,v^{\text{LB}}_{\text{master}}\bigr)$.
+         \Comment{Gurobi's branch-and-bound bound}
+
+  \For{each route $r \in \mathcal{R}$}
+    \If{$\bar{H}_r > 0$}
+      \State $f_r \leftarrow \bar{D}_r^{2} / \bar{H}_r$
+    \Else
+      \State $f_r \leftarrow 0$
+    \EndIf
+  \EndFor
+
+  \State $\varphi_{\text{true}} \leftarrow \sum_r f_r$.
+  \State Compute $W_{\text{lab}}$ via \eqref{eq:wlab} using
+         $\varphi_{\text{true}}$.
+  \State $v_{\text{actual}} \leftarrow
+         g(\bar{x},\bar{y},\bar{z},\bar{\eta},\bar{\theta})
+         + W_{\text{lab}}$.
+  \If{$v_{\text{actual}} < \overline{v}$}
+    \State $\overline{v} \leftarrow v_{\text{actual}}$;\quad
+           save current routing as best solution.
+  \EndIf
+
+  \State $\delta_{\text{SOC}} \leftarrow
+         \max_{r}\,\bigl(f_r - \bar{\beta}_r\bigr)$.
+  \State $\text{gap} \leftarrow
+         (\overline{v} - \underline{v})\,/\,|\overline{v}|$.
+
+  \If{$\delta_{\text{SOC}} \leq \epsilon_{\text{SOC}}$
+      \textbf{ and }
+      $\text{gap} \leq \epsilon_{\text{gap}}$}
+    \State \textbf{break} \Comment{Converged}
+  \EndIf
+
+  \For{each $r \in \mathcal{R}$ with $f_r - \bar{\beta}_r > \epsilon_{\text{SOC}}$}
+    \State Add to $\mathcal{L}$: \quad
+           $\beta_r \;\geq\;
+            \dfrac{2\bar{D}_r}{\bar{H}_r}\,D_r
+            - \left(\dfrac{\bar{D}_r}{\bar{H}_r}\right)^{\!2} H_r$
+    \label{alg:cut}
+  \EndFor
+
+\Until{time limit $T_{\max}$ reached}
+
+\State \textbf{Return} best solution found, $\overline{v}$,
+       $\underline{v}$, gap, iteration log.
+
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Correctness and Convergence}
+
+\begin{theorem}[Valid lower bound]
+At every iteration, the master objective value is a valid lower bound
+on the optimal value of the full MIQCP.
+\end{theorem}
+
+\begin{proof}
+Every OA cut \eqref{eq:oa_cut} is a necessary condition for
+$\beta_r \geq D_r^2/H_r$.  Hence the feasible region of the master
+contains the projection of the MIQCP feasible set onto $(x,y,z,\beta)$
+space at every iteration.  The master therefore minimises over a
+superset of feasible solutions, giving a lower bound.
+\end{proof}
+
+\begin{theorem}[Finite convergence]
+Algorithm~\ref{alg:lshaped} converges in finitely many iterations
+when the routing variables $(x,y,z)$ take values in a finite set.
+\end{theorem}
+
+\begin{proof}
+Given fixed binary $x$ and $y$ and integer $z$, the values of $D_r$
+and $H_r$ are fully determined by the linear constraints of the
+model.  There are finitely many such combinations.  At each iteration
+where the algorithm does not terminate, at least one new OA cut is
+added that is violated by the current solution.  Because OA cuts are
+never removed, the same $(D_r,H_r)$ combination cannot repeat without
+the cut being satisfied, so the algorithm visits each combination at
+most once before termination.
+\end{proof}
+
+\subsection{Relationship to the L-Shaped Method}
+
+The algorithm follows the spirit of the L-shaped decomposition of
+\citet{VanSlyke1969} and its extension to integer programmes by
+\citet{Laporte1993}.  In the classical stochastic VRP setting
+\citep{Laporte1993,Laporte2002}, the second stage evaluates a
+recourse function $Q(y)$ that is convex in the first-stage variables
+$y$; optimality cuts $\theta \geq Q(y^*)+ \nabla Q(y^*)^\top(y-y^*)$
+are added to the master.  Our setting is deterministic but nonlinear:
+the ``recourse'' is the evaluation of $\varphi = \sum_r D_r^2/H_r$,
+and the supporting hyperplane of Proposition~\ref{prop:oa} plays the
+role of the optimality cut.  The key structural advantage is that the
+cut is \emph{linear} in the master variables $D_r$ and $H_r$—both
+already present in the routing model—so no auxiliary subproblem needs
+to be solved; the cut coefficients are computed in closed form from the
+master solution.
+
+\subsection{Implementation Details}
+
+The master model is built once before the loop and modified
+in-place by appending OA constraints (line~\ref{alg:cut} of
+Algorithm~\ref{alg:lshaped}); Gurobi's incremental modelling interface
+avoids rebuilding the branch-and-bound tree from scratch.  Gurobi's
+internal bound ($v^{\text{LB}}_{\text{master}}$) from the most recent
+solve is used as the lower bound update, which is tighter than the
+master's objective value when the solve is terminated by a time limit.
+
+The algorithm is terminated when both criteria hold simultaneously:
+(i) the maximum SOC violation
+$\delta_{\text{SOC}} = \max_r (f_r - \bar\beta_r) \leq 10^{-4}$,
+ensuring that all $\beta_r$ values correctly represent $D_r^2/H_r$;
+and (ii) the optimality gap
+$(\overline{v}-\underline{v})/|\overline{v}| \leq 10^{-3}$,
+ensuring near-global optimality.
+
+For routes with $\bar{H}_r = 0$ (empty routes carrying no clinics),
+the term $D_r^2/H_r$ is zero by convention and no cut is added.
+
+\medskip
+\noindent
+The implementation is available as \texttt{lshaped\_solver.py} and
+returns the same structured output as the direct Gurobi solver,
+making it a drop-in replacement in the experimental pipeline.
+
+% ── Bibliography entries to add to your .bib file ────────────────────────────
+% @article{VanSlyke1969,
+%   author  = {Van Slyke, Richard M. and Wets, Roger},
+%   title   = {L-shaped linear programs with applications to optimal
+%               control and stochastic programming},
+%   journal = {SIAM Journal on Applied Mathematics},
+%   volume  = {17}, number = {4}, pages = {638--663}, year = {1969}
+% }
+% @article{Laporte1993,
+%   author  = {Laporte, Gilbert and Louveaux, Fran\c{c}ois V.},
+%   title   = {The integer {L}-shaped method for stochastic integer
+%               programs with complete recourse},
+%   journal = {Operations Research Letters},
+%   volume  = {13}, number = {3}, pages = {133--142}, year = {1993}
+% }
+% @article{Laporte2002,
+%   author  = {Laporte, Gilbert and Louveaux, Fran\c{c}ois V.
+%               and van Hamme, Luc},
+%   title   = {An integer {L}-shaped algorithm for the capacitated
+%               vehicle routing problem with stochastic demands},
+%   journal = {Operations Research},
+%   volume  = {50}, number = {3}, pages = {415--423}, year = {2002}
+% }
