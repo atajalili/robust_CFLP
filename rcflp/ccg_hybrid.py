@@ -199,31 +199,34 @@ def solve_CCG_hybrid(
                          theta_bar, u2_bar, gamma_bar, cut_id):
         """
         Add the linear optimality cut derived from the subproblem dual.
-        For non-open facilities the subproblem returns big_M; we zero those
-        out here since their x[j,r] = 0 anyway and big_M causes numerics.
+
+        Uses the same formula as BDCP: all j ∈ J are included, with
+        big_M returned by the subproblem for non-open facilities.  The
+        large negative coefficient (-capacity * big_M * x[j,r]) for a
+        closed facility makes the cut trivially satisfied whenever the
+        master opens a new facility, preserving global validity.
 
         Skipped when x0 has no open facilities: the subproblem is then
-        degenerate (all duals zero) and would add `nue >= 0`, which
-        permanently corrupts the master's lower bound.
+        degenerate (all duals zero) and the constant term is 0, so the
+        cut `nue >= 0` would permanently lock the master's lower bound.
         """
-        open_J = [j for j in J if sum(x0[j, r] for r in R) > 0.5]
-        if not open_J:
-            return  # degenerate cut — skip
+        if not any(x0[j, r] > 0.5 for j in J for r in R):
+            return  # degenerate first iteration — skip
 
         master.addConstr(
             nue >= - gp.quicksum(alpha_bar[i] for i in I)
                    - gp.quicksum(
                          capacity[j, r] * x[j, r] * (1 - h / (Hn - 1))
                          * theta_bar[j, h]
-                         for j in open_J for r in R for h in H)
+                         for j in J for r in R for h in H)
                    - gp.quicksum(
                          capacity[j, r] * x[j, r] * (1 - h / (Hn - 1))
                          * u2_bar[j, h]
-                         for j in open_J for r in R for h in H)
+                         for j in J for r in R for h in H)
                    - gp.quicksum(
                          capacity[j, r] * x[j, r] * (1 - h / (Hn - 1))
                          * gamma_bar[j, h]
-                         for j in open_J for r in R for h in H)
+                         for j in J for r in R for h in H)
                    + gp.quicksum(t2_bar[i]   for i in I)
                    - gp.quicksum(beta_bar[i] for i in I),
             name=f"benders_cut_{cut_id}",
