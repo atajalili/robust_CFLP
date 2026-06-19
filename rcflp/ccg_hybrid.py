@@ -201,8 +201,14 @@ def solve_CCG_hybrid(
         Add the linear optimality cut derived from the subproblem dual.
         For non-open facilities the subproblem returns big_M; we zero those
         out here since their x[j,r] = 0 anyway and big_M causes numerics.
+
+        Skipped when x0 has no open facilities: the subproblem is then
+        degenerate (all duals zero) and would add `nue >= 0`, which
+        permanently corrupts the master's lower bound.
         """
         open_J = [j for j in J if sum(x0[j, r] for r in R) > 0.5]
+        if not open_J:
+            return  # degenerate cut — skip
 
         master.addConstr(
             nue >= - gp.quicksum(alpha_bar[i] for i in I)
