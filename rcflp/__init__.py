@@ -18,6 +18,7 @@ from rcflp.instance   import instancemaker
 from rcflp.nominal    import solve_nominal
 from rcflp.subproblem import solve_subproblem_dual
 from rcflp.ccg        import solve_CCG
+from rcflp.ccg_hybrid import solve_CCG_hybrid
 from rcflp.bdcp       import solve_BDCP
 from rcflp.warmstart  import solve_robust_warmstart
 
@@ -26,6 +27,7 @@ __all__ = [
     "solve_nominal",
     "solve_subproblem_dual",
     "solve_CCG",
+    "solve_CCG_hybrid",
     "solve_BDCP",
     "solve_robust_warmstart",
 ]
