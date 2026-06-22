@@ -564,7 +564,10 @@ def solve_CCG(
         U_j, L_j, t_master = _solve_master()
         _manage_blocks()
 
-        LB_now   = L_ell if use_exploit else L_j
+        # In partial-block (RPBD) mode, ObjBound can exceed ObjVal when the
+        # master terminates at MIPGap, giving a falsely small gap.  Use the
+        # primal objective U_j, which is always a valid (conservative) LB.
+        LB_now   = L_ell if use_exploit else (U_j if use_partial else L_j)
         abs_UB   = abs(UB) + 1e-10
         true_gap = (UB - LB_now) / abs_UB
         inex_gap = (UB - U_j)   / abs_UB
