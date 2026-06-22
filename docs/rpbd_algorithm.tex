@@ -1,0 +1,378 @@
+% ============================================================
+% Random Partial Benders Decomposition for Robust CFLP
+% Adapted from Pauphilet & Wang (2024) to the two-stage
+% robust Congested Facility Location Problem with M/M/1
+% congestion and budget uncertainty.
+% ============================================================
+
+\section{Scalable C\&CG via Partial Scenario Blocks}
+\label{sec:rpbd}
+
+\subsection{Motivation}
+\label{sec:rpbd:motivation}
+
+The standard Column-and-Constraint Generation (C\&CG) algorithm
+of \citet{ZengZhao2013} solves the two-stage robust problem
+\begin{equation}
+  \min_{x \in \mathcal{X}}\; f(x) + \max_{\varepsilon \in \Xi}\; Q(x,\varepsilon)
+  \label{eq:robust}
+\end{equation}
+by iteratively adding \emph{scenario blocks} to a master Mixed-Integer
+Second-Order Cone Programme (MISOCP).
+Each scenario block introduced at iteration $t$ for scenario
+$\bar{\varepsilon}^{t}$ adds
+\begin{equation*}
+  O\!\left(|\mathcal{I}|\cdot|\mathcal{J}|\cdot|\mathcal{R}|\right)
+\end{equation*}
+continuous variables and constraints to the master, where
+$\mathcal{I}$, $\mathcal{J}$, $\mathcal{R}$ are the sets of
+customers, candidate facilities, and capacity levels, respectively.
+After $T$ iterations the master contains
+$O\!\left(T \cdot |\mathcal{I}|\cdot|\mathcal{J}|\cdot|\mathcal{R}|\right)$
+variables, making each subsequent solve progressively more expensive.
+Table~\ref{tab:time performance} confirms this: for instances with
+$|\mathcal{J}| \ge 15$ the algorithm either times out or requires
+hours of computation even for moderate $\Gamma$.
+
+To address this scalability bottleneck we propose a
+\emph{partial block} strategy inspired by the Random Partial Benders
+Decomposition (RPBD) framework of \citet{PauphiletWang2024}.
+The key idea is to add, at each iteration, \emph{two} complementary
+but cheap cuts instead of one expensive full block:
+\begin{enumerate}
+  \item a \textbf{linear Benders cut} covering \emph{all} active
+        facilities — computationally cheap, globally valid, but loose;
+  \item a \textbf{partial SOC block} covering only the
+        $k = \lceil \phi\,|\mathcal{J}^{t}| \rceil$ most
+        \emph{congestion-critical} facilities — tighter for the
+        facilities that matter most, at a fraction of the cost.
+\end{enumerate}
+Together these two cuts enforce
+$\eta \ge \max\!\left(
+  \text{Benders}(x),\;
+  \text{SOC}_{\mathcal{J}^{t}_{\mathrm{retain}}}(x,y,C)
+\right)$
+without an auxiliary binary variable, because both are added as
+separate $\ge$ constraints on the surrogate objective variable $\eta$.
+The master grows at $O(\phi \cdot |\mathcal{I}|\cdot|\mathcal{J}|\cdot|\mathcal{R}|)$
+per iteration — a $1/\phi$ reduction in variable growth.
+
+% ------------------------------------------------------------
+\subsection{Background: Standard C\&CG Master}
+\label{sec:rpbd:standard}
+
+Let $x \in \{0,1\}^{|\mathcal{J}|\times|\mathcal{R}|}$ denote the
+first-stage facility-opening decisions and $\eta \in \mathbb{R}$ the
+epigraph variable bounding worst-case recourse cost.
+After $T$ iterations the standard C\&CG master is
+\begin{align}
+  \min_{x,\eta,y^t,C^t,Q^t}\;&
+    \sum_{j\in\mathcal{J}}\sum_{r\in\mathcal{R}} f_{jr}\,x_{jr}
+    + \eta
+    \label{eq:master:obj}\\
+  \text{s.t.}\quad&
+    \sum_{r\in\mathcal{R}} x_{jr} \le 1
+    && \forall\, j\in\mathcal{J}
+    \label{eq:master:open}\\
+  &\eta \ge
+    \sum_{i,j,r} c^1_{ij}\,y^t_{ijr}
+    + \sum_i c^2_i\,Q^t_i
+    + \sum_{j,r} w_j\,C^t_{jr}
+    && \forall\, t = 1,\ldots,T
+    \label{eq:master:optcut}\\
+  &\text{(assignment, capacity, M/M/1 SOC constraints for each block } t)
+    \notag\\
+  &x_{jr}\in\{0,1\},\quad
+    y^t_{ijr}\in[0,1],\quad
+    Q^t_i,C^t_{jr}\ge 0
+    \notag
+\end{align}
+where $c^1_{ij}$, $c^2_i$, $w_j$ are transportation, congestion-penalty,
+and congestion-cost coefficients respectively.
+The M/M/1 second-order cone constraints for scenario $t$ are
+\begin{equation}
+  \left(\lambda^t_{jr}\right)^2
+  \;\le\;
+  \Bigl(\bar\varepsilon^t_j\,\mu_{jr}\,C^t_{jr} - \lambda^t_{jr}\Bigr)
+  \Bigl(\bar\varepsilon^t_j\,\mu_{jr}\,x_{jr}   - \lambda^t_{jr}\Bigr),
+  \qquad \forall\,j\in\mathcal{J}^t,\; r\in\mathcal{R}
+  \label{eq:master:soc}
+\end{equation}
+where $\lambda^t_{jr} = \sum_i d_i\,y^t_{ijr}$ is the load at facility
+$j$ under capacity level $r$, $\mu_{jr}$ is the capacity, and
+$\bar\varepsilon^t_j = \sum_h (1 - h/(H-1))\,\bar\varepsilon^t_{jh}$
+is the effective capacity factor under scenario $\bar\varepsilon^t$.
+
+% ------------------------------------------------------------
+\subsection{Benders Cut from the Subproblem Dual}
+\label{sec:rpbd:benders}
+
+The subproblem separation oracle maximises over $\varepsilon\in\Xi$
+and simultaneously dualises the inner SOCP recourse.
+When solved with dual extraction (\texttt{return\_duals=True}),
+it returns dual variables
+$\alpha_i,\,\beta_i,\,t2_i$ for customer constraints and
+linearised products
+$\tilde\theta_{jh} = \varepsilon_{jh}\,\theta_j$,
+$\tilde u_{2,jh} = \varepsilon_{jh}\,u_{2,j}$,
+$\tilde\gamma_{jh} = \varepsilon_{jh}\,\gamma_j$
+for facility-level cone multipliers.
+The resulting Benders optimality cut is
+\begin{equation}
+  \eta \;\ge\;
+  -\sum_{i\in\mathcal{I}} \alpha_i
+  \;-\; \sum_{j\in\mathcal{J}}\sum_{r\in\mathcal{R}}\sum_{h=0}^{H-1}
+        \mu_{jr}\,x_{jr}\,\Bigl(1 - \tfrac{h}{H-1}\Bigr)
+        \Bigl(\tilde\theta_{jh} + \tilde u_{2,jh} + \tilde\gamma_{jh}\Bigr)
+  \;+\; \sum_{i\in\mathcal{I}} t2_i
+  \;-\; \sum_{i\in\mathcal{I}} \beta_i.
+  \label{eq:benders:cut}
+\end{equation}
+This cut is \emph{linear} in $x$ and provides a valid global lower
+bound on $Q(x,\bar\varepsilon)$ for \emph{all} $j\in\mathcal{J}$.
+Its weakness is that it approximates the nonlinear M/M/1 congestion
+cost with a supporting hyperplane, which can be loose when the
+current $x$ is far from the dual solution.
+
+% ------------------------------------------------------------
+\subsection{Partial SOC Block Construction}
+\label{sec:rpbd:partial}
+
+Given scenario $\bar\varepsilon^t$ with active set
+$\mathcal{J}^t = \{j : \bar\varepsilon^t_j > 0\}$,
+define the \emph{criticality score} of facility $j$ as
+\begin{equation}
+  \sigma_j^t
+  \;=\;
+  \frac{w_j \cdot \bar\varepsilon^t_j}
+       {\bar\mu_j + \delta},
+  \qquad
+  \bar\mu_j = \frac{1}{|\mathcal{R}|}\sum_{r\in\mathcal{R}} \mu_{jr},
+  \label{eq:score}
+\end{equation}
+where $w_j$ is the congestion cost, $\bar\varepsilon^t_j$ is the
+effective capacity degradation, and $\delta > 0$ is a small constant
+for numerical stability.
+Facilities with high congestion cost and high degradation under
+$\bar\varepsilon^t$ contribute most to the worst-case recourse
+and are therefore prioritised for exact SOC treatment.
+
+Let $\phi \in (0,1)$ be the \emph{retention fraction} (parameter
+\texttt{partial\_block\_fraction}).
+Define the \emph{retained set}
+\begin{equation}
+  \mathcal{J}^t_{\mathrm{retain}}
+  \;=\;
+  \text{top-}k\text{ facilities in } \mathcal{J}^t
+  \text{ by score } \sigma_j^t,
+  \quad
+  k = \left\lceil \phi\,|\mathcal{J}^t| \right\rceil.
+  \label{eq:retain}
+\end{equation}
+The partial SOC block for $\mathcal{J}^t_{\mathrm{retain}}$ adds
+variables $y^t_{ijr}$, $C^t_{jr}$, $V^t_{1,jr}$, $V^t_{2,jr}$,
+$V^t_{3,jr}$, $Q^t_i$ and the constraints
+\eqref{eq:master:optcut}--\eqref{eq:master:soc}
+restricted to $j \in \mathcal{J}^t_{\mathrm{retain}}$.
+Its associated opt-cut is
+\begin{equation}
+  \eta \;\ge\;
+  \sum_{i\in\mathcal{I}}\sum_{j\in\mathcal{J}^t_{\mathrm{retain}}}\sum_{r\in\mathcal{R}}
+    c^1_{ij}\,y^t_{ijr}
+  + \sum_{i\in\mathcal{I}} c^2_i\,Q^t_i
+  + \sum_{j\in\mathcal{J}^t_{\mathrm{retain}}}\sum_{r\in\mathcal{R}} w_j\,C^t_{jr}.
+  \label{eq:partial:optcut}
+\end{equation}
+Since all costs are non-negative,
+$Q(x,\bar\varepsilon^t) \ge Q_{\mathcal{J}^t_{\mathrm{retain}}}(x,\bar\varepsilon^t)$,
+so \eqref{eq:partial:optcut} is a valid lower bound on the true
+worst-case recourse even though it covers only a subset of facilities.
+
+\begin{proposition}[Validity of the partial block]
+\label{prop:validity}
+Both the Benders cut \eqref{eq:benders:cut} and the partial SOC
+opt-cut \eqref{eq:partial:optcut} are valid lower bounds on
+$Q(x,\bar\varepsilon^t)$ for all feasible $x \in \mathcal{X}$.
+Adding both as separate $\ge$ constraints on $\eta$ enforces
+$\eta \ge \max\!\left(\eqref{eq:benders:cut},\,\eqref{eq:partial:optcut}\right)$,
+which is a tighter bound than either cut alone.
+\end{proposition}
+
+\begin{proof}
+The Benders cut follows from LP strong duality applied to the inner
+SOCP for fixed $(x,\bar\varepsilon^t)$ \citep[Lemma~1]{ZengZhao2013}.
+The partial opt-cut holds because
+$Q(x,\bar\varepsilon^t) \ge \sum_{j\in\mathcal{J}^t_{\mathrm{retain}}} Q_j(x,\bar\varepsilon^t) \ge 0$
+since individual facility costs are non-negative.
+The $\max$ follows immediately from having both constraints active on
+the same variable $\eta$. \qed
+\end{proof}
+
+% ------------------------------------------------------------
+\subsection{Algorithm}
+\label{sec:rpbd:algorithm}
+
+Algorithm~\ref{alg:rpbd} states the complete procedure.
+
+\begin{algorithm}[t]
+\caption{Partial-Block C\&CG (RPBD mode)}
+\label{alg:rpbd}
+\begin{algorithmic}[1]
+\Require
+  Instance data, uncertainty budget $\Gamma$, levels $H$,
+  initial solution $x^0$, tolerance $\epsilon_{\mathrm{tol}}$,
+  retention fraction $\phi\in(0,1)$,
+  master MIP gap $\delta_{\mathrm{mp}}$, master time limit $\tau$.
+\Ensure
+  Near-optimal robust solution $x^*$, bounds $\mathrm{UB}$, $\mathrm{LB}$.
+\State $\mathrm{UB} \leftarrow +\infty$; \;
+       $\mathrm{LB} \leftarrow -\infty$; \;
+       $t \leftarrow 0$
+\State Build master \eqref{eq:master:obj}--\eqref{eq:master:open}
+       with variables $x$ and $\eta$ only.
+\Repeat
+  \State \textbf{// Subproblem (separation oracle with dual extraction)}
+  \State $(\bar\varepsilon^t,\, \alpha, \beta, t_2, \tilde\theta, \tilde u_2, \tilde\gamma,\, Q^*) \leftarrow
+         \textsc{Subproblem}(x^t,\,\text{return\_duals}=\mathrm{True})$
+  \State $\mathrm{UB} \leftarrow \min\!\left(\mathrm{UB},\;
+         Q^* + f(x^t)\right)$
+  \State \textbf{// Add Benders cut \eqref{eq:benders:cut} (all $j\in\mathcal{J}$)}
+  \State Add constraint \eqref{eq:benders:cut} to master.
+  \State \textbf{// Add partial SOC block \eqref{eq:partial:optcut}--\eqref{eq:master:soc}}
+  \State Compute scores $\sigma_j^t$ via \eqref{eq:score} for
+         $j\in\mathcal{J}^t$.
+  \State $\mathcal{J}^t_{\mathrm{retain}} \leftarrow
+         \text{top-}\lceil\phi|\mathcal{J}^t|\rceil
+         \text{ facilities by } \sigma_j^t$
+  \State Add variables $y^t_{ijr}$, $C^t_{jr}$, $V^t_{\cdot,jr}$,
+         $Q^t_i$ and constraints for $j\in\mathcal{J}^t_{\mathrm{retain}}$,
+         including opt-cut \eqref{eq:partial:optcut} and SOC
+         \eqref{eq:master:soc}.
+  \State \textbf{// Solve master}
+  \State $(x^{t+1},\,\eta^{t+1},\,\mathrm{LB}) \leftarrow
+         \textsc{SolveMaster}(\delta_{\mathrm{mp}},\,\tau)$
+  \State $t \leftarrow t + 1$
+\Until{$(\mathrm{UB} - \mathrm{LB})\,/\,|\mathrm{UB}| \le \epsilon_{\mathrm{tol}}$
+       \textbf{ or } time limit exceeded}
+\State \Return $x^t$, $\mathrm{UB}$, $\mathrm{LB}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Master size growth]
+At iteration $t$, the master contains
+\begin{equation*}
+  |\mathcal{J}||\mathcal{R}| + 1
+  \;+\; t\!\cdot\!\left(
+    |\mathcal{I}| + \lceil\phi|\mathcal{J}|\rceil \cdot |\mathcal{R}|
+    \cdot(|\mathcal{I}|+4)
+  \right)
+\end{equation*}
+variables, compared with
+$|\mathcal{J}||\mathcal{R}| + 1 + t\cdot|\mathcal{I}|\cdot|\mathcal{J}|\cdot|\mathcal{R}|\cdot(1+4/|\mathcal{I}|)$
+for standard C\&CG\@.
+The reduction factor is approximately $\phi$ in the dominant term.
+\end{remark}
+
+\begin{remark}[Correctness]
+Algorithm~\ref{alg:rpbd} is a valid outer-approximation scheme.
+Each master solve yields a lower bound $\mathrm{LB} \le \min_x f(x)+\max_\varepsilon Q(x,\varepsilon)$
+because both cuts \eqref{eq:benders:cut} and \eqref{eq:partial:optcut}
+are valid relaxations.
+The subproblem provides an upper bound $\mathrm{UB}$ by evaluating
+the true worst-case recourse at the current $x^t$.
+Convergence is guaranteed when $\phi > 0$ because the Benders cuts
+alone are sufficient for asymptotic convergence (as in standard BDCP),
+and the partial SOC blocks accelerate gap closure.
+\end{remark}
+
+% ------------------------------------------------------------
+\subsection{Connection to RPBD}
+\label{sec:rpbd:connection}
+
+\citet{PauphiletWang2024} propose to randomly retain a fraction of
+continuous recourse variables in the master of a Benders decomposition,
+rather than projecting all of them out.
+They show empirically that this typically halves convergence time on
+network design and facility location benchmarks, and provide theoretical
+bounds on the improvement to the LP relaxation.
+
+Our adaptation differs in three respects suited to the CFLP setting:
+\begin{enumerate}
+  \item \textbf{Deterministic selection.}
+        Rather than random retention, we select facilities
+        greedily by criticality score $\sigma_j^t$
+        \eqref{eq:score}. This is well-suited to our problem
+        because the congestion bottleneck is concentrated at a
+        small number of high-demand, low-capacity facilities.
+  \item \textbf{Dual Benders cut always added.}
+        Standard RPBD adds only the retained-variable block.
+        We additionally add a full linear Benders cut at every
+        iteration, providing a global lower bound even for the
+        $1-\phi$ fraction of facilities not in the SOC block.
+  \item \textbf{SOCP recourse.}
+        The original RPBD paper targets LP recourse.
+        Our recourse is a second-order cone programme due to M/M/1
+        congestion costs; the partial-retention principle applies
+        unchanged because both cuts remain valid lower bounds
+        (Proposition~\ref{prop:validity}).
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{Implementation Details}
+\label{sec:rpbd:impl}
+
+The algorithm is implemented in \texttt{rcflp/ccg.py} as
+\texttt{solve\_CCG} with parameter
+\texttt{partial\_block\_fraction} $= \phi \in (0,1)$.
+When $\phi = 1$ the method reduces to standard C\&CG\@.
+Key implementation choices:
+
+\paragraph{Facility ranking.}
+At each iteration, $\mathcal{J}^t_{\mathrm{retain}}$ is recomputed
+from the current scenario $\bar\varepsilon^t$, so the selected
+facilities adapt to which locations the adversary targets.
+
+\paragraph{Dual extraction.}
+Setting \texttt{return\_duals=True} in the subproblem call returns
+the linearised dual products $\tilde\theta_{jh}$, $\tilde u_{2,jh}$,
+$\tilde\gamma_{jh}$ needed for cut \eqref{eq:benders:cut}.
+This is incompatible with the \texttt{exclude\_scenario} integer cut
+used when \texttt{n\_scenarios=2}; accordingly \texttt{n\_scenarios}
+is forced to 1 in RPBD mode.
+
+\paragraph{Combination with block dropping.}
+Setting \texttt{max\_active\_blocks} $= m$ additionally removes the
+oldest non-binding partial block from the master once more than $m$
+blocks are active, keeping master size bounded at
+$O(m\cdot\phi\cdot|\mathcal{I}|\cdot|\mathcal{J}|\cdot|\mathcal{R}|)$
+regardless of iteration count.
+
+\paragraph{Recommended parameter values.}
+Based on preliminary experiments we recommend $\phi = 0.4$ as a
+starting point, retaining approximately the top 40\% of
+congestion-critical facilities per block.
+Values $\phi < 0.3$ risk slow convergence; values $\phi > 0.7$
+provide little size reduction over the full block.
+
+% ============================================================
+% References (add to your main .bib file)
+% ============================================================
+%
+% @article{ZengZhao2013,
+%   author  = {Zeng, B. and Zhao, L.},
+%   title   = {Solving two-stage robust optimization problems using
+%              a column-and-constraint generation method},
+%   journal = {Operations Research Letters},
+%   volume  = {41},
+%   number  = {5},
+%   pages   = {457--461},
+%   year    = {2013}
+% }
+%
+% @article{PauphiletWang2024,
+%   author  = {Pauphilet, J. and Wang, Y.},
+%   title   = {The Surprising Performance of Random Partial Benders
+%              Decomposition},
+%   journal = {Preprint, London Business School},
+%   year    = {2024}
+% }
