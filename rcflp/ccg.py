@@ -274,9 +274,11 @@ def solve_CCG(
             }
             ranked = sorted(J_active, key=lambda j: -score_j[j])
             k_retain = max(1, math.ceil(partial_block_fraction * len(J_active)))
-            J_socp = ranked[:k_retain]      # exact SOC treatment
+            J_socp    = ranked[:k_retain]                        # exact SOC
+            J_dropped = [j for j in J_active if j not in set(J_socp)]  # linear only
         else:
-            J_socp = J_active               # full block (MODE 1 / 2)
+            J_socp    = J_active   # full block (MODE 1 / 2)
+            J_dropped = []
 
         # ── Benders cut (full scenario) — only in RPBD mode ──────────────────
         if use_partial and duals is not None:
@@ -295,11 +297,19 @@ def solve_CCG(
             opt_cuts.append(bc)
             n_benders += 1
 
-        # ── SOC block for J_socp ─────────────────────────────────────────────
+        # ── Variables: y for ALL J_active; V1/V2/V3/C only for J_socp ────────
+        # J_dropped facilities get linear capacity only (SOC removed = relaxation).
         for i in I:
             Q[s, i]   = master.addVar(lb=0, ub=1, name=f"Q_{s}_{i}")
             VV1[s, i] = master.addVar(lb=0,       name=f"VV1_{s}_{i}")
             bvars += [Q[s, i], VV1[s, i]]
+
+        for j in J_active:
+            for r in R:
+                for i in I:
+                    y[s, i, j, r] = master.addVar(lb=0, ub=1,
+                                                   name=f"y_{s}_{i}_{j}_{r}")
+                    bvars.append(y[s, i, j, r])
 
         for j in J_socp:
             for r in R:
@@ -308,15 +318,11 @@ def solve_CCG(
                 V3[s, j, r] = master.addVar(lb=0, name=f"V3_{s}_{j}_{r}")
                 C[s, j, r]  = master.addVar(lb=0, name=f"C_{s}_{j}_{r}")
                 bvars += [V1[s, j, r], V2[s, j, r], V3[s, j, r], C[s, j, r]]
-                for i in I:
-                    y[s, i, j, r] = master.addVar(lb=0, ub=1,
-                                                   name=f"y_{s}_{i}_{j}_{r}")
-                    bvars.append(y[s, i, j, r])
 
-        # opt_cut for the SOC block
+        # opt_cut: assignment + service costs over ALL J_active; congestion for J_socp only
         socp_cut = master.addConstr(
             nue >= gp.quicksum(coeff1[i, j] * y[s, i, j, r]
-                               for i in I for j in J_socp for r in R)
+                               for i in I for j in J_active for r in R)
                  + gp.quicksum(coeff2[i] * Q[s, i] for i in I)
                  + gp.quicksum(congestion_cost[j] * C[s, j, r]
                                for j in J_socp for r in R),
@@ -324,22 +330,24 @@ def solve_CCG(
         )
         opt_cuts.append(socp_cut)
 
+        # Customer allocation constraints over ALL J_active
         for i in I:
             c1 = master.addConstr(
                 VV1[s, i] == gp.quicksum(y[s, i, j, r]
-                                         for j in J_socp for r in R)
+                                         for j in J_active for r in R)
             )
             c2 = master.addConstr(
                 gp.quicksum(y[s, i, j, r]
-                            for j in J_socp for r in R) <= 1
+                            for j in J_active for r in R) <= 1
             )
             bconstrs += [c1, c2]
-            for j in J_socp:
+            for j in J_active:
                 bconstrs.append(master.addConstr(
                     gp.quicksum(y[s, i, j, r] for r in R) <= 1
                 ))
 
-        for j in J_socp:
+        # Capacity and y ≤ x for ALL J_active
+        for j in J_active:
             bconstrs.append(master.addConstr(
                 gp.quicksum(demand[i] * y[s, i, j, r] for i in I for r in R)
                 <= eps_scalar[j] * gp.quicksum(capacity[j, r] * x[j, r] for r in R)
@@ -347,6 +355,12 @@ def solve_CCG(
             bconstrs.append(master.addConstr(
                 gp.quicksum(x[j, r] for r in R) <= 1
             ))
+            for r in R:
+                for i in I:
+                    bconstrs.append(master.addConstr(y[s, i, j, r] <= x[j, r]))
+
+        # SOC constraints only for J_socp (exact); J_dropped gets only capacity above
+        for j in J_socp:
             for r in R:
                 lam = gp.quicksum(demand[i] * y[s, i, j, r] for i in I)
                 bconstrs.append(master.addConstr(V1[s, j, r] == lam))
@@ -358,8 +372,6 @@ def solve_CCG(
                     V3[s, j, r] ==
                     eps_scalar[j] * capacity[j, r] * x[j, r] - lam
                 ))
-                for i in I:
-                    bconstrs.append(master.addConstr(y[s, i, j, r] <= x[j, r]))
 
         for i in I:
             master.addQConstr(VV1[s, i] ** 2 <= Q[s, i])
@@ -564,10 +576,7 @@ def solve_CCG(
         U_j, L_j, t_master = _solve_master()
         _manage_blocks()
 
-        # In partial-block (RPBD) mode, ObjBound can exceed ObjVal when the
-        # master terminates at MIPGap, giving a falsely small gap.  Use the
-        # primal objective U_j, which is always a valid (conservative) LB.
-        LB_now   = L_ell if use_exploit else (U_j if use_partial else L_j)
+        LB_now   = L_ell if use_exploit else L_j
         abs_UB   = abs(UB) + 1e-10
         true_gap = (UB - LB_now) / abs_UB
         inex_gap = (UB - U_j)   / abs_UB
