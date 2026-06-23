@@ -4,63 +4,34 @@ rcflp.ccg
 Column-and-Constraint Generation (C&CG) for the two-stage robust CFLP.
 
 ════════════════════════════════════════════════════════════════════════════
-OPERATING MODES — set via CCG_PARAMS in the notebook
+OPERATING MODES
 ════════════════════════════════════════════════════════════════════════════
 
-MODE 1 · Pure CCG  (baseline)
-─────────────────────────────────────────────────────────────────────────
-  eps_e             = 0.0      no exploit phase; no lb_anchor constraint
-  master_time_limit = 2000     per-master time limit (seconds)
-  n_scenarios       = 1        one worst-case scenario added per iteration
-  n_warmstart       = 0        no heuristic pre-population
-  max_active_blocks = None     master grows unboundedly
+MODE 1 · Pure CCG                                           eps_e = 0.0
+──────────────────────────────────────────────────────────────────────────
+  Each iteration: solve subproblem → add full SOC block → solve master.
+  Master grows by O(|I|×|J|×|R|) per iteration.
 
-  Best for: instances where J ≤ 10 (master stays manageable).
-
-────────────────────────────────────────────────────────────────────────
-MODE 2 · CCG + Option A  (bounded master size for medium J)
-────────────────────────────────────────────────────────────────────────
-  All MODE 1 settings, plus:
-  n_warmstart       = 3–5      add k heuristic blocks before the main loop
-                               (facilities ranked by congestion_cost/capacity
-                                degraded to maximum level)
-  max_active_blocks = 8–12     drop oldest non-binding block when master
-                               exceeds this count
-  drop_patience     = 2        block must be non-binding for this many
-                               consecutive iterations before dropping
-
-  Effect: keeps master size bounded at O(max_active_blocks × I × J × R).
-  Algorithm remains correct — the subproblem re-discovers any dropped
-  scenario if it later becomes worst-case again.
-  Trade-off: may increase iteration count slightly.
-
-  Best for: J = 10–25; when master grows but dropping is affordable.
-
-────────────────────────────────────────────────────────────────────────
-MODE 3 · i-C&CG exploit phase  (experimental)
-────────────────────────────────────────────────────────────────────────
-  eps_e   > 0   (e.g. 0.005)   activates exploit loop
-  alpha   = 0.8                MIPGap reduction factor per exploit step
-  beta    = 300                time-limit increment per exploit step (s)
+MODE 2 · i-C&CG                                            eps_e > 0.0
+──────────────────────────────────────────────────────────────────────────
+  Adds an exploit phase when the primal gap (UB − U_j)/|UB| drops below
+  eps_e: tightens master MIPGap (×alpha each step) and extends its time
+  limit (+beta seconds each step) to push L_j up before adding new blocks.
 
   WARNING: activates an lb_anchor constraint whose RHS changes each
-  iteration — this invalidates Gurobi's LP basis warm-start and
-  typically makes the algorithm SLOWER for this problem.
-  Use eps_e = 0.0 unless you specifically want to test i-C&CG.
+  iteration, which invalidates Gurobi's LP warm-start.  Use only when
+  the master is very fast to re-solve from scratch.
 
-════════════════════════════════════════════════════════════════════════
-PARAMETER QUICK REFERENCE
-════════════════════════════════════════════════════════════════════════
-master_mip_gap         MIPGap for the master MISOCP              [0.015]
-master_time_limit      Per-master Gurobi time limit (s)           [2000]
-n_scenarios            Diverse scenarios per iteration          [1 or 2]
-eps_e                  i-C&CG inexact gap threshold — 0 = off      [0.0]
-alpha                  i-C&CG MIPGap reduction per exploit step    [0.8]
-beta                   i-C&CG time-limit increment per step (s)   [300]
-n_warmstart            Heuristic blocks added before main loop       [0]
-max_active_blocks      Hard cap on live blocks (None = off)        [None]
-drop_patience          Non-binding iters before a block is dropped   [2]
-════════════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════════════════
+PARAMETERS
+════════════════════════════════════════════════════════════════════════════
+master_mip_gap    MIPGap for the master MISOCP                    [0.015]
+master_time_limit Per-master Gurobi time limit (s)                 [2000]
+n_scenarios       Diverse worst-case scenarios added per iter    [1 or 2]
+eps_e             i-C&CG primal gap threshold — 0.0 = MODE 1       [0.0]
+alpha             i-C&CG MIPGap reduction factor per exploit step   [0.8]
+beta              i-C&CG time-limit increment per exploit step (s)  [300]
+════════════════════════════════════════════════════════════════════════════
 """
 
 import time
@@ -70,50 +41,6 @@ from gurobipy import GRB
 from rcflp.subproblem import solve_subproblem_dual
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Heuristic warm-start scenario generator
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _heuristic_scenarios(inst, Hn: int, uncertainty_budget: float, n: int) -> list:
-    """
-    Generate up to n scenario dicts (eps_bar) without solving any optimisation.
-
-    Ranks facilities by congestion_cost / avg_capacity (most sensitive to
-    disruption) and creates one scenario per sliding window of Γ facilities,
-    each degraded to the maximum level h = H-1.
-    """
-    J     = inst["J"]
-    R     = inst["R"]
-    H     = list(range(Hn))
-    Gamma = int(round(uncertainty_budget))
-
-    avg_cap = {j: sum(inst["capacity"][j, r] for r in R) / len(R) for j in J}
-    score   = {j: inst["congestion_cost"][j] / (avg_cap[j] + 1e-10) for j in J}
-    ranked  = sorted(J, key=lambda j: -score[j])
-
-    def _make(degraded):
-        dset    = set(degraded)
-        eps_bar = {}
-        for j in J:
-            for h in H:
-                eps_bar[j, h] = 0.0
-            eps_bar[j, Hn - 1 if j in dset else 0] = 1.0
-        return eps_bar
-
-    scenarios, n_j = [], len(ranked)
-    for start in range(min(n, n_j)):
-        s = _make([ranked[(start + k) % n_j] for k in range(min(Gamma, n_j))])
-        if s not in scenarios:
-            scenarios.append(s)
-        if len(scenarios) >= n:
-            break
-    return scenarios
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main solver
-# ─────────────────────────────────────────────────────────────────────────────
-
 def solve_CCG(
     inst: dict,
     uncertainty_budget: float,
@@ -122,27 +49,25 @@ def solve_CCG(
     tol: float = 0.01,
     big_M: float = 10_000,
     time_limit: float = 6 * 3600,
-    # ── master solver settings ──────────────────────────────────────────
     master_mip_gap: float = 0.015,
     master_time_limit: float = 2000,
     n_scenarios: int = 1,
     L_init: float = -1e10,
-    # ── i-C&CG exploit phase (MODE 4) ──────────────────────────────────
     eps_e: float = 0.0,
     alpha: float = 0.8,
     beta: float = 300,
-    # ── Option A: scenario management (MODE 2) ──────────────────────────
-    n_warmstart: int = 0,
-    max_active_blocks: int = None,
-    drop_patience: int = 2,
-    # ── misc ─────────────────────────────────────────────────────────────
     verbose: bool = False,
 ) -> dict:
+    """
+    Solve the two-stage robust CFLP via C&CG.
 
-    I  = inst["I"]
-    J  = inst["J"]
-    R  = inst["R"]
-    H  = list(range(Hn))
+    Returns a dict with keys:
+      x_jr, LB, UB, profit_LB, n_iter, n_blocks, runtime, converged, iter_log
+    """
+    I               = inst["I"]
+    J               = inst["J"]
+    R               = inst["R"]
+    H               = list(range(Hn))
     demand          = inst["demand"]
     capacity        = inst["capacity"]
     fixed_cost      = inst["fixed_cost"]
@@ -152,8 +77,6 @@ def solve_CCG(
 
     use_exploit = eps_e > 0.0
 
-    avg_cap = {j: sum(capacity[j, r] for r in R) / len(R) for j in J}
-
     start     = time.time()
     UB        = 0.0
     x0        = x_init
@@ -162,14 +85,14 @@ def solve_CCG(
     converged = False
     iter_log  = []
 
-    # i-C&CG state
+    # i-C&CG state (only meaningful when use_exploit=True)
     L      = L_init
     L_ell  = L_init
     ell    = 0
     eps_mp = master_mip_gap
     tau    = master_time_limit
 
-    # Per-variable dicts (keyed by scenario index s)
+    # Per-scenario variable dicts (keyed by scenario index s)
     y   = {}
     C   = {}
     Q   = {}
@@ -177,15 +100,6 @@ def solve_CCG(
     V1  = {}
     V2  = {}
     V3  = {}
-
-    # Scenario bookkeeping
-    active_blocks      = []
-    block_vars         = {}
-    block_constrs      = {}      # linear/quadratic constraints (excl. opt_cuts)
-    opt_cut_constrs    = {}      # s -> list of opt_cut constraints (1 in full mode, 2 in partial)
-    J_active_per_block = {}
-    block_non_binding  = {}
-    eps_bar_per_block  = {}
 
     # ── Build master ─────────────────────────────────────────────────────────
     master = gp.Model("CCG_master")
@@ -208,9 +122,8 @@ def solve_CCG(
         obj_expr  = gp.quicksum(fixed_cost[j, r] * x[j, r] for j in J for r in R) + nue
         lb_constr = master.addConstr(obj_expr >= L, name="lb_anchor")
 
-    # ── Helper: add one scenario block ───────────────────────────────────────
+    # ── Add one full SOC scenario block ──────────────────────────────────────
     def _add_block(eps_bar):
-        """Add one full SOC scenario block for eps_bar to the master."""
         nonlocal s_counter
 
         eps_scalar = {
@@ -219,12 +132,9 @@ def solve_CCG(
         }
         s        = s_counter
         J_active = [j for j in J if eps_scalar[j] > 0]
-        J_active_per_block[s] = J_active
-        eps_bar_per_block[s]  = eps_bar
 
         bvars    = []
         bconstrs = []
-        opt_cuts = []
 
         for i in I:
             Q[s, i]   = master.addVar(lb=0, ub=1, name=f"Q_{s}_{i}")
@@ -239,11 +149,10 @@ def solve_CCG(
                 C[s, j, r]  = master.addVar(lb=0, name=f"C_{s}_{j}_{r}")
                 bvars += [V1[s, j, r], V2[s, j, r], V3[s, j, r], C[s, j, r]]
                 for i in I:
-                    y[s, i, j, r] = master.addVar(lb=0, ub=1,
-                                                   name=f"y_{s}_{i}_{j}_{r}")
+                    y[s, i, j, r] = master.addVar(lb=0, ub=1, name=f"y_{s}_{i}_{j}_{r}")
                     bvars.append(y[s, i, j, r])
 
-        socp_cut = master.addConstr(
+        master.addConstr(
             nue >= gp.quicksum(coeff1[i, j] * y[s, i, j, r]
                                for i in I for j in J_active for r in R)
                  + gp.quicksum(coeff2[i] * Q[s, i] for i in I)
@@ -251,18 +160,14 @@ def solve_CCG(
                                for j in J_active for r in R),
             name=f"opt_cut_{s}",
         )
-        opt_cuts.append(socp_cut)
 
         for i in I:
-            c1 = master.addConstr(
-                VV1[s, i] == gp.quicksum(y[s, i, j, r]
-                                         for j in J_active for r in R)
-            )
-            c2 = master.addConstr(
-                gp.quicksum(y[s, i, j, r]
-                            for j in J_active for r in R) <= 1
-            )
-            bconstrs += [c1, c2]
+            bconstrs.append(master.addConstr(
+                VV1[s, i] == gp.quicksum(y[s, i, j, r] for j in J_active for r in R)
+            ))
+            bconstrs.append(master.addConstr(
+                gp.quicksum(y[s, i, j, r] for j in J_active for r in R) <= 1
+            ))
             for j in J_active:
                 bconstrs.append(master.addConstr(
                     gp.quicksum(y[s, i, j, r] for r in R) <= 1
@@ -280,12 +185,10 @@ def solve_CCG(
                 lam = gp.quicksum(demand[i] * y[s, i, j, r] for i in I)
                 bconstrs.append(master.addConstr(V1[s, j, r] == lam))
                 bconstrs.append(master.addConstr(
-                    V2[s, j, r] ==
-                    eps_scalar[j] * capacity[j, r] * C[s, j, r] - lam
+                    V2[s, j, r] == eps_scalar[j] * capacity[j, r] * C[s, j, r] - lam
                 ))
                 bconstrs.append(master.addConstr(
-                    V3[s, j, r] ==
-                    eps_scalar[j] * capacity[j, r] * x[j, r] - lam
+                    V3[s, j, r] == eps_scalar[j] * capacity[j, r] * x[j, r] - lam
                 ))
                 for i in I:
                     bconstrs.append(master.addConstr(y[s, i, j, r] <= x[j, r]))
@@ -296,77 +199,16 @@ def solve_CCG(
         for j in J_active:
             if congestion_cost[j] != 0:
                 for r in R:
-                    master.addQConstr(
-                        V1[s, j, r] ** 2 <= V2[s, j, r] * V3[s, j, r]
-                    )
+                    master.addQConstr(V1[s, j, r] ** 2 <= V2[s, j, r] * V3[s, j, r])
 
-        block_vars[s]        = bvars
-        block_constrs[s]     = bconstrs
-        opt_cut_constrs[s]   = opt_cuts
-        block_non_binding[s] = 0
-        active_blocks.append(s)
         s_counter += 1
 
-    # ── Helper: remove a non-binding block ───────────────────────────────────
-    def _drop_block(s):
-        master.remove(block_vars[s])
-        master.remove(block_constrs[s])
-        master.remove(opt_cut_constrs[s])
-        active_blocks.remove(s)
-        J_act = J_active_per_block[s]
-        for i in I:
-            del Q[s, i], VV1[s, i]
-        for j in J_act:
-            for r in R:
-                if (s, j, r) in V1:
-                    del V1[s, j, r], V2[s, j, r], V3[s, j, r], C[s, j, r]
-                for i in I:
-                    if (s, i, j, r) in y:
-                        del y[s, i, j, r]
-        del block_vars[s], block_constrs[s], opt_cut_constrs[s]
-        del J_active_per_block[s], block_non_binding[s]
-
-    # ── Helper: update non-binding counters; drop when over cap ──────────────
-    def _manage_blocks():
-        if not active_blocks:
-            return
-        nue_val = nue.x
-        for s in list(active_blocks):
-            # Use the last opt_cut (the SOC cut) to check binding
-            oc = opt_cut_constrs[s][-1]
-            try:
-                slack = nue_val - oc.getAttr("RHS") - master.getRow(oc).getValue()
-            except Exception:
-                slack = 0.0
-            # simpler slack approximation via Slack attribute if available
-            try:
-                slack = -oc.Slack   # Slack = LHS - RHS for >= constraints; negative = binding
-            except Exception:
-                pass
-            if slack > 1e-4 * (abs(nue_val) + 1.0):
-                block_non_binding[s] += 1
-            else:
-                block_non_binding[s] = 0
-
-        if max_active_blocks is not None:
-            while len(active_blocks) > max_active_blocks:
-                candidate = max(active_blocks,
-                                key=lambda s: (block_non_binding[s], -s))
-                if block_non_binding[candidate] >= drop_patience:
-                    if verbose:
-                        print(f"    → drop block {candidate} "
-                              f"(non-binding {block_non_binding[candidate]} iters)")
-                    _drop_block(candidate)
-                else:
-                    break
-
-    # ── Helper: solve subproblem ──────────────────────────────────────────────
+    # ── Solve subproblem; optionally add a second diverse scenario ────────────
     def _solve_subproblem(remaining):
         if remaining < 1.0:
             return None, None, None
 
-        fixed_now = sum(fixed_cost[j, r] * x0[j, r] for j in J for r in R)
-
+        fixed_now    = sum(fixed_cost[j, r] * x0[j, r] for j in J for r in R)
         eps_bar_list, sub_obj = solve_subproblem_dual(
             x0, inst, uncertainty_budget, Hn,
             big_M=big_M, time_limit=min(tau, remaining),
@@ -387,7 +229,7 @@ def solve_CCG(
 
         return eps_bar_list, sub_obj, fixed_now
 
-    # ── Helper: solve master ──────────────────────────────────────────────────
+    # ── Solve master; update i-C&CG state ────────────────────────────────────
     def _solve_master():
         nonlocal n_iter, L, L_ell, ell, x0
         master.Params.MIPGap    = eps_mp
@@ -412,54 +254,46 @@ def solve_CCG(
 
         return U_j, L_j, t_master
 
-    # ── Helper: log ───────────────────────────────────────────────────────────
+    # ── Log one iteration ─────────────────────────────────────────────────────
     def _log(U_j, L_j, t_sub, t_master, true_gap, inex_gap, mode):
         iter_log.append({
-            "iter":          n_iter,
-            "LB":            L_ell if use_exploit else -U_j,
-            "UB":            UB,
-            "U_j":           U_j,
-            "L_j":           L_j,
-            "gap_pct":       round(true_gap * 100, 4),
-            "inex_gap":      round(inex_gap * 100, 4),
-            "mode":          mode,
-            "ell":           ell,
-            "eps_mp":        eps_mp,
-            "tau":           tau,
-            "n_blocks":      s_counter,
-            "active_blocks": len(active_blocks),
-            "t_sub":         round(t_sub,    3),
-            "t_master":      round(t_master, 3),
-            "elapsed":       time.time() - start,
+            "iter":     n_iter,
+            "LB":       L_ell if use_exploit else -U_j,
+            "UB":       UB,
+            "U_j":      U_j,
+            "L_j":      L_j,
+            "gap_pct":  round(true_gap * 100, 4),
+            "inex_gap": round(inex_gap * 100, 4),
+            "mode":     mode,
+            "ell":      ell,
+            "eps_mp":   eps_mp,
+            "tau":      tau,
+            "n_blocks": s_counter,
+            "t_sub":    round(t_sub,    3),
+            "t_master": round(t_master, 3),
+            "elapsed":  time.time() - start,
         })
         if verbose:
             lb_show = -L_ell if use_exploit else -U_j
             print(
-                f"  iter {n_iter:3d} [{mode:7s}] "
-                f"| profit≥{-UB:10.2f} | LB={lb_show:10.2f} "
-                f"| gap={true_gap*100:.2f}% "
-                f"| blocks={len(active_blocks)}/{s_counter} "
-                f"| sub={t_sub:.1f}s master={t_master:.1f}s"
+                f"  iter {n_iter:3d} [{mode:7s}]"
+                f" | profit≥{-UB:10.2f} | LB={lb_show:10.2f}"
+                f" | gap={true_gap*100:.2f}%"
+                f" | blocks={s_counter}"
+                f" | sub={t_sub:.1f}s master={t_master:.1f}s"
             )
 
-    # ── Warm-start: heuristic blocks before main loop ─────────────────────────
-    if n_warmstart > 0:
-        warm_scens = _heuristic_scenarios(inst, Hn, uncertainty_budget, n_warmstart)
-        for eps_bar in warm_scens:
-            _add_block(eps_bar)
-        if verbose:
-            print(f"  warm-start: added {len(warm_scens)} heuristic blocks")
-
-    # ── Main loop: subproblem → add block(s) → solve master ───────────────────
+    # ── Main loop ─────────────────────────────────────────────────────────────
     while True:
         elapsed = time.time() - start
         if elapsed > time_limit:
             break
 
-        # Step 1: subproblem
-        t_sub_start = time.time()
-        remaining   = max(0.0, time_limit - elapsed)
-        eps_bar_list, sub_obj, fixed_now = _solve_subproblem(remaining)
+        # Step 1: solve subproblem → update UB
+        t_sub_start              = time.time()
+        eps_bar_list, sub_obj, fixed_now = _solve_subproblem(
+            max(0.0, time_limit - elapsed)
+        )
         t_sub = time.time() - t_sub_start
 
         if eps_bar_list is None:
@@ -467,31 +301,29 @@ def solve_CCG(
 
         UB = min(UB, sub_obj + fixed_now)
 
-        # Step 2: add block(s)
+        # Step 2: add block(s) to master
         for eps_bar in eps_bar_list:
             _add_block(eps_bar)
 
-        # Step 3: solve master
+        # Step 3: solve master → update LB
         U_j, L_j, t_master = _solve_master()
-        _manage_blocks()
 
         LB_now   = L_ell if use_exploit else L_j
         abs_UB   = abs(UB) + 1e-10
         true_gap = (UB - LB_now) / abs_UB
-        inex_gap = (UB - U_j)   / abs_UB
+        inex_gap = (UB - U_j)    / abs_UB
 
         _log(U_j, L_j, t_sub, t_master, true_gap, inex_gap, "explore")
 
-        # Step 4: convergence
+        # Step 4: check convergence
         if true_gap <= tol:
             converged = True
             break
 
-        # Step 5: exploit phase (MODE 4 only)
+        # Step 5: i-C&CG exploit phase (MODE 2 only)
         if use_exploit and inex_gap < eps_e:
-            max_exploit_iters = 5
-            n_exploit_iters   = 0
-            while inex_gap < eps_e and n_exploit_iters < max_exploit_iters:
+            n_exploit_iters = 0
+            while inex_gap < eps_e and n_exploit_iters < 5:
                 elapsed = time.time() - start
                 if elapsed > time_limit:
                     break
@@ -503,11 +335,11 @@ def solve_CCG(
                     print(f"    → exploit: eps_mp={eps_mp:.5f} tau={tau:.0f}s")
 
                 U_j, L_j, t_master = _solve_master()
-                _manage_blocks()
 
                 t_sub_start = time.time()
-                remaining   = max(0.0, time_limit - (time.time() - start))
-                eps_bar_list, sub_obj, fixed_now = _solve_subproblem(remaining)
+                eps_bar_list, sub_obj, fixed_now = _solve_subproblem(
+                    max(0.0, time_limit - (time.time() - start))
+                )
                 t_sub = time.time() - t_sub_start
 
                 if eps_bar_list is None:
@@ -533,14 +365,13 @@ def solve_CCG(
     best_LB = L_ell if use_exploit else (iter_log[-1]["L_j"] if iter_log else L_init)
 
     return {
-        "x_jr":                x0,
-        "LB":                  best_LB,
-        "UB":                  UB,
-        "profit_LB":           -UB,
-        "n_iter":              n_iter,
-        "n_blocks":            s_counter,
-        "active_blocks":       len(active_blocks),
-        "runtime":             time.time() - start,
-        "converged":           converged,
-        "iter_log":            iter_log,
+        "x_jr":      x0,
+        "LB":        best_LB,
+        "UB":        UB,
+        "profit_LB": -UB,
+        "n_iter":    n_iter,
+        "n_blocks":  s_counter,
+        "runtime":   time.time() - start,
+        "converged": converged,
+        "iter_log":  iter_log,
     }
