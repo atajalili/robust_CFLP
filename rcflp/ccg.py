@@ -7,12 +7,11 @@ Column-and-Constraint Generation (C&CG) for the two-stage robust CFLP.
 OPERATING MODES — set via CCG_PARAMS in the notebook
 ════════════════════════════════════════════════════════════════════════════
 
-MODE 1 · Pure CCG  (baseline — matches original February implementation)
+MODE 1 · Pure CCG  (baseline)
 ─────────────────────────────────────────────────────────────────────────
   eps_e             = 0.0      no exploit phase; no lb_anchor constraint
   master_time_limit = 2000     per-master time limit (seconds)
   n_scenarios       = 1        one worst-case scenario added per iteration
-  partial_block_fraction = 1.0 full SOC block per scenario (all J)
   n_warmstart       = 0        no heuristic pre-population
   max_active_blocks = None     master grows unboundedly
 
@@ -35,35 +34,10 @@ MODE 2 · CCG + Option A  (bounded master size for medium J)
   scenario if it later becomes worst-case again.
   Trade-off: may increase iteration count slightly.
 
-  Best for: J = 10–20; when master grows but dropping is affordable.
+  Best for: J = 10–25; when master grows but dropping is affordable.
 
 ────────────────────────────────────────────────────────────────────────
-MODE 3 · RPBD partial block  (scales to large J)
-────────────────────────────────────────────────────────────────────────
-  partial_block_fraction = 0.3–0.6   fraction of J_active to include in
-                                      the SOC block (rest get Benders cut)
-  eps_e             = 0.0
-  n_scenarios       = 1        (forced; dual return not compatible with 2)
-
-  Per iteration, for each scenario ε*:
-    · Solve subproblem with duals (return_duals=True)
-    · Add a LINEAR Benders cut covering ALL J_active       [cheap, always]
-    · Add a PARTIAL SOC block for top-k facilities
-        k = ceil(partial_block_fraction × |J_active|)
-        ranked by  congestion_cost[j] × eps_scalar[j] / avg_capacity[j]
-      [tight for most-critical facilities; SOCP constraints in master]
-
-  Both cuts are valid lower bounds on the scenario recourse. Together
-  they give  nue ≥ max(Benders, partial_SOC)  without an auxiliary var,
-  because both are added as separate ≥ constraints on nue.
-
-  Master grows at  O(fraction × I × J × R)  per iteration instead of
-  O(I × J × R). Combine with max_active_blocks for full size control.
-
-  Best for: J ≥ 15 where full CCG blocks become prohibitively large.
-
-────────────────────────────────────────────────────────────────────────
-MODE 4 · i-C&CG exploit phase  (experimental)
+MODE 3 · i-C&CG exploit phase  (experimental)
 ────────────────────────────────────────────────────────────────────────
   eps_e   > 0   (e.g. 0.005)   activates exploit loop
   alpha   = 0.8                MIPGap reduction factor per exploit step
@@ -79,18 +53,16 @@ PARAMETER QUICK REFERENCE
 ════════════════════════════════════════════════════════════════════════
 master_mip_gap         MIPGap for the master MISOCP              [0.015]
 master_time_limit      Per-master Gurobi time limit (s)           [2000]
-n_scenarios            Extra diverse scenarios per iteration     [1 or 2]
+n_scenarios            Diverse scenarios per iteration          [1 or 2]
 eps_e                  i-C&CG inexact gap threshold — 0 = off      [0.0]
 alpha                  i-C&CG MIPGap reduction per exploit step    [0.8]
 beta                   i-C&CG time-limit increment per step (s)   [300]
 n_warmstart            Heuristic blocks added before main loop       [0]
 max_active_blocks      Hard cap on live blocks (None = off)        [None]
 drop_patience          Non-binding iters before a block is dropped   [2]
-partial_block_fraction RPBD fraction of J in SOC block (1.0=full) [1.0]
 ════════════════════════════════════════════════════════════════════════
 """
 
-import math
 import time
 import gurobipy as gp
 from gurobipy import GRB
@@ -163,8 +135,6 @@ def solve_CCG(
     n_warmstart: int = 0,
     max_active_blocks: int = None,
     drop_patience: int = 2,
-    # ── RPBD partial block (MODE 3) ─────────────────────────────────────
-    partial_block_fraction: float = 1.0,
     # ── misc ─────────────────────────────────────────────────────────────
     verbose: bool = False,
 ) -> dict:
@@ -181,9 +151,6 @@ def solve_CCG(
     congestion_cost = inst["congestion_cost"]
 
     use_exploit = eps_e > 0.0
-    use_partial = 0.0 < partial_block_fraction < 1.0
-    # n_scenarios > 1 is incompatible with return_duals=True (subproblem API)
-    eff_n_scenarios = 1 if use_partial else n_scenarios
 
     avg_cap = {j: sum(capacity[j, r] for r in R) / len(R) for j in J}
 
@@ -192,7 +159,6 @@ def solve_CCG(
     x0        = x_init
     n_iter    = 0
     s_counter = 0
-    n_benders = 0
     converged = False
     iter_log  = []
 
@@ -243,14 +209,9 @@ def solve_CCG(
         lb_constr = master.addConstr(obj_expr >= L, name="lb_anchor")
 
     # ── Helper: add one scenario block ───────────────────────────────────────
-    def _add_block(eps_bar, duals=None):
-        """
-        Add scenario block for eps_bar to the master.
-
-        duals : tuple (alpha, beta, t2, theta, u2, gamma) from subproblem —
-                required when use_partial=True; ignored otherwise.
-        """
-        nonlocal s_counter, n_benders
+    def _add_block(eps_bar):
+        """Add one full SOC scenario block for eps_bar to the master."""
+        nonlocal s_counter
 
         eps_scalar = {
             j: sum((1 - h / (Hn - 1)) * eps_bar[j, h] for h in H)
@@ -265,40 +226,6 @@ def solve_CCG(
         bconstrs = []
         opt_cuts = []
 
-        # ── Select facilities for the SOC block ──────────────────────────────
-        if use_partial and duals is not None and J_active:
-            # Rank J_active by importance: high congestion & high degradation
-            score_j = {
-                j: congestion_cost[j] * eps_scalar[j] / (avg_cap[j] + 1e-10)
-                for j in J_active
-            }
-            ranked = sorted(J_active, key=lambda j: -score_j[j])
-            k_retain = max(1, math.ceil(partial_block_fraction * len(J_active)))
-            J_socp    = ranked[:k_retain]                        # exact SOC
-            J_dropped = [j for j in J_active if j not in set(J_socp)]  # linear only
-        else:
-            J_socp    = J_active   # full block (MODE 1 / 2)
-            J_dropped = []
-
-        # ── Benders cut (full scenario) — only in RPBD mode ──────────────────
-        if use_partial and duals is not None:
-            alpha_d, beta_d, t2_d, theta_d, u2_d, gamma_d = duals
-            cut_expr = (
-                -gp.quicksum(alpha_d[i] for i in I)
-                - gp.quicksum(
-                    capacity[j, r] * x[j, r] * (1 - h / (Hn - 1))
-                    * (theta_d[j, h] + u2_d[j, h] + gamma_d[j, h])
-                    for j in J for r in R for h in H
-                )
-                + gp.quicksum(t2_d[i] for i in I)
-                - gp.quicksum(beta_d[i] for i in I)
-            )
-            bc = master.addConstr(nue >= cut_expr, name=f"bcut_{s}")
-            opt_cuts.append(bc)
-            n_benders += 1
-
-        # ── Variables: y for ALL J_active; V1/V2/V3/C only for J_socp ────────
-        # J_dropped facilities get linear capacity only (SOC removed = relaxation).
         for i in I:
             Q[s, i]   = master.addVar(lb=0, ub=1, name=f"Q_{s}_{i}")
             VV1[s, i] = master.addVar(lb=0,       name=f"VV1_{s}_{i}")
@@ -306,31 +233,26 @@ def solve_CCG(
 
         for j in J_active:
             for r in R:
-                for i in I:
-                    y[s, i, j, r] = master.addVar(lb=0, ub=1,
-                                                   name=f"y_{s}_{i}_{j}_{r}")
-                    bvars.append(y[s, i, j, r])
-
-        for j in J_socp:
-            for r in R:
                 V1[s, j, r] = master.addVar(lb=0, name=f"V1_{s}_{j}_{r}")
                 V2[s, j, r] = master.addVar(lb=0, name=f"V2_{s}_{j}_{r}")
                 V3[s, j, r] = master.addVar(lb=0, name=f"V3_{s}_{j}_{r}")
                 C[s, j, r]  = master.addVar(lb=0, name=f"C_{s}_{j}_{r}")
                 bvars += [V1[s, j, r], V2[s, j, r], V3[s, j, r], C[s, j, r]]
+                for i in I:
+                    y[s, i, j, r] = master.addVar(lb=0, ub=1,
+                                                   name=f"y_{s}_{i}_{j}_{r}")
+                    bvars.append(y[s, i, j, r])
 
-        # opt_cut: assignment + service costs over ALL J_active; congestion for J_socp only
         socp_cut = master.addConstr(
             nue >= gp.quicksum(coeff1[i, j] * y[s, i, j, r]
                                for i in I for j in J_active for r in R)
                  + gp.quicksum(coeff2[i] * Q[s, i] for i in I)
                  + gp.quicksum(congestion_cost[j] * C[s, j, r]
-                               for j in J_socp for r in R),
+                               for j in J_active for r in R),
             name=f"opt_cut_{s}",
         )
         opt_cuts.append(socp_cut)
 
-        # Customer allocation constraints over ALL J_active
         for i in I:
             c1 = master.addConstr(
                 VV1[s, i] == gp.quicksum(y[s, i, j, r]
@@ -346,7 +268,6 @@ def solve_CCG(
                     gp.quicksum(y[s, i, j, r] for r in R) <= 1
                 ))
 
-        # Capacity and y ≤ x for ALL J_active
         for j in J_active:
             bconstrs.append(master.addConstr(
                 gp.quicksum(demand[i] * y[s, i, j, r] for i in I for r in R)
@@ -355,12 +276,6 @@ def solve_CCG(
             bconstrs.append(master.addConstr(
                 gp.quicksum(x[j, r] for r in R) <= 1
             ))
-            for r in R:
-                for i in I:
-                    bconstrs.append(master.addConstr(y[s, i, j, r] <= x[j, r]))
-
-        # SOC constraints only for J_socp (exact); J_dropped gets only capacity above
-        for j in J_socp:
             for r in R:
                 lam = gp.quicksum(demand[i] * y[s, i, j, r] for i in I)
                 bconstrs.append(master.addConstr(V1[s, j, r] == lam))
@@ -372,11 +287,13 @@ def solve_CCG(
                     V3[s, j, r] ==
                     eps_scalar[j] * capacity[j, r] * x[j, r] - lam
                 ))
+                for i in I:
+                    bconstrs.append(master.addConstr(y[s, i, j, r] <= x[j, r]))
 
         for i in I:
             master.addQConstr(VV1[s, i] ** 2 <= Q[s, i])
 
-        for j in J_socp:
+        for j in J_active:
             if congestion_cost[j] != 0:
                 for r in R:
                     master.addQConstr(
@@ -446,46 +363,29 @@ def solve_CCG(
     # ── Helper: solve subproblem ──────────────────────────────────────────────
     def _solve_subproblem(remaining):
         if remaining < 1.0:
-            return None, None, None, None
+            return None, None, None
 
         fixed_now = sum(fixed_cost[j, r] * x0[j, r] for j in J for r in R)
 
-        if use_partial:
-            # Need duals for Benders cut; only one scenario per call
-            result = solve_subproblem_dual(
-                x0, inst, uncertainty_budget, Hn,
-                big_M=big_M, time_limit=min(tau, remaining),
-                return_duals=True, n_scenarios=1,
-            )
-            eps_map, alpha_d, beta_d, t2_d, theta_d, u2_d, gamma_d, sub_obj = result
-            eps_bar_list = [eps_map]
-            duals_list   = [(alpha_d, beta_d, t2_d, theta_d, u2_d, gamma_d)]
-        else:
-            eps_bar_list, sub_obj = solve_subproblem_dual(
+        eps_bar_list, sub_obj = solve_subproblem_dual(
+            x0, inst, uncertainty_budget, Hn,
+            big_M=big_M, time_limit=min(tau, remaining),
+            return_duals=False, n_scenarios=1,
+        )
+
+        if n_scenarios >= 2:
+            eps_bar_list2, _ = solve_subproblem_dual(
                 x0, inst, uncertainty_budget, Hn,
                 big_M=big_M, time_limit=min(tau, remaining),
                 return_duals=False, n_scenarios=1,
+                exclude_scenario=eps_bar_list[0],
             )
-            duals_list = [None]
+            key1 = frozenset((j, h) for (j, h), v in eps_bar_list[0].items()  if v > 0.5)
+            key2 = frozenset((j, h) for (j, h), v in eps_bar_list2[0].items() if v > 0.5)
+            if key2 != key1:
+                eps_bar_list = eps_bar_list + eps_bar_list2
 
-            if eff_n_scenarios >= 2:
-                key1 = frozenset(
-                    (j, h) for (j, h), v in eps_bar_list[0].items() if v > 0.5
-                )
-                eps_bar_list2, _ = solve_subproblem_dual(
-                    x0, inst, uncertainty_budget, Hn,
-                    big_M=big_M, time_limit=min(tau, remaining),
-                    return_duals=False, n_scenarios=1,
-                    exclude_scenario=eps_bar_list[0],
-                )
-                key2 = frozenset(
-                    (j, h) for (j, h), v in eps_bar_list2[0].items() if v > 0.5
-                )
-                if key2 != key1:
-                    eps_bar_list = eps_bar_list + eps_bar_list2
-                    duals_list   = duals_list + [None]
-
-        return eps_bar_list, duals_list, sub_obj, fixed_now
+        return eps_bar_list, sub_obj, fixed_now
 
     # ── Helper: solve master ──────────────────────────────────────────────────
     def _solve_master():
@@ -528,7 +428,6 @@ def solve_CCG(
             "tau":           tau,
             "n_blocks":      s_counter,
             "active_blocks": len(active_blocks),
-            "n_benders":     n_benders,
             "t_sub":         round(t_sub,    3),
             "t_master":      round(t_master, 3),
             "elapsed":       time.time() - start,
@@ -547,7 +446,7 @@ def solve_CCG(
     if n_warmstart > 0:
         warm_scens = _heuristic_scenarios(inst, Hn, uncertainty_budget, n_warmstart)
         for eps_bar in warm_scens:
-            _add_block(eps_bar, duals=None)
+            _add_block(eps_bar)
         if verbose:
             print(f"  warm-start: added {len(warm_scens)} heuristic blocks")
 
@@ -560,7 +459,7 @@ def solve_CCG(
         # Step 1: subproblem
         t_sub_start = time.time()
         remaining   = max(0.0, time_limit - elapsed)
-        eps_bar_list, duals_list, sub_obj, fixed_now = _solve_subproblem(remaining)
+        eps_bar_list, sub_obj, fixed_now = _solve_subproblem(remaining)
         t_sub = time.time() - t_sub_start
 
         if eps_bar_list is None:
@@ -569,8 +468,8 @@ def solve_CCG(
         UB = min(UB, sub_obj + fixed_now)
 
         # Step 2: add block(s)
-        for eps_bar, duals in zip(eps_bar_list, duals_list):
-            _add_block(eps_bar, duals=duals)
+        for eps_bar in eps_bar_list:
+            _add_block(eps_bar)
 
         # Step 3: solve master
         U_j, L_j, t_master = _solve_master()
@@ -608,7 +507,7 @@ def solve_CCG(
 
                 t_sub_start = time.time()
                 remaining   = max(0.0, time_limit - (time.time() - start))
-                eps_bar_list, duals_list, sub_obj, fixed_now = _solve_subproblem(remaining)
+                eps_bar_list, sub_obj, fixed_now = _solve_subproblem(remaining)
                 t_sub = time.time() - t_sub_start
 
                 if eps_bar_list is None:
@@ -628,8 +527,8 @@ def solve_CCG(
             if converged:
                 break
             if eps_bar_list is not None:
-                for eps_bar, duals in zip(eps_bar_list, duals_list):
-                    _add_block(eps_bar, duals=duals)
+                for eps_bar in eps_bar_list:
+                    _add_block(eps_bar)
 
     best_LB = L_ell if use_exploit else (iter_log[-1]["L_j"] if iter_log else L_init)
 
@@ -641,7 +540,6 @@ def solve_CCG(
         "n_iter":              n_iter,
         "n_blocks":            s_counter,
         "active_blocks":       len(active_blocks),
-        "n_benders":           n_benders,
         "runtime":             time.time() - start,
         "converged":           converged,
         "iter_log":            iter_log,

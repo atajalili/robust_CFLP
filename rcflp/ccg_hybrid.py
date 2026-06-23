@@ -48,11 +48,10 @@ def solve_CCG_hybrid(
     eps_e: float = 0.009,
     alpha: float = 0.8,
     beta: float = 300,
-    # Option A / RPBD parameters accepted but not used (API compatibility with solve_CCG)
+    # Option A parameters accepted but not used (API compatibility with solve_CCG)
     n_warmstart: int = 0,
     max_active_blocks: int = None,
     drop_patience: int = 2,
-    partial_block_fraction: float = 1.0,
     verbose: bool = False,
 ) -> dict:
     """
