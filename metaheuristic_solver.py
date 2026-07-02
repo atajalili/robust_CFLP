@@ -73,7 +73,8 @@ def feasible_at_max_vehicles(clinics, L_r, demand, Q, V):
 # 2. VEHICLE ALLOCATION  (objective-aware greedy)
 # =============================================================================
 
-def allocate_vehicles(routes, L, demand_on_route, Q, V, Vn, Rn, obj, T_visits=None):
+def allocate_vehicles(routes, L, demand_on_route, Q, V, Vn, Rn, obj,
+                       T_visits=None, K=None, mu=None, rho=None, Cn=None):
     """
     Determine the vehicle allocation z_r for each route.
 
@@ -81,8 +82,9 @@ def allocate_vehicles(routes, L, demand_on_route, Q, V, Vn, Rn, obj, T_visits=No
             for each route.  Return (None, None) if any route is
             infeasible even at max vehicles.
 
-    Step 2: Distribute remaining vehicles greedily, scored by the
-            improvement in the chosen objective.
+    Step 2: Distribute remaining vehicles by exhaustive enumeration
+            (for ATAT_Min / MTAT_Min) using the *full* objective including
+            the W_lab term, which depends on H[r] = L[r]/z[r].
 
     Returns
     -------
@@ -108,21 +110,15 @@ def allocate_vehicles(routes, L, demand_on_route, Q, V, Vn, Rn, obj, T_visits=No
         if not assigned:
             return None, None   # truly infeasible route
 
-    
     if sum(z.values()) > Vn:
         return None, None  # minimum feasible allocation exceeds fleet size
-    
-    # ---- Step 2: greedy distribution of remaining vehicles -------------------
+
     # ---- Step 2: distribute remaining vehicles --------------------------------
     remaining = Vn - sum(z.values())
-    
-    if obj in ("MTAT_Min", "ATAT_Min") and T_visits is not None and remaining > 0:#if obj == "MTAT_Min" and T_visits is not None and remaining > 0:
-        
-        #print(f"  [EXHAUSTIVE] obj={obj}, remaining={remaining}, active={[r for r in R if demand_on_route[r]]}")
-        # Exhaustive allocation — enumerate all distributions of remaining
-        # vehicles across active routes and pick the one minimising MTAT.
+
+    if obj in ("MTAT_Min", "ATAT_Min") and T_visits is not None and remaining > 0:
         active = [r for r in R if demand_on_route[r]]
-    
+
         def distribute(extra, routes, current, results):
             if not routes:
                 results.append(dict(current))
@@ -136,49 +132,79 @@ def allocate_vehicles(routes, L, demand_on_route, Q, V, Vn, Rn, obj, T_visits=No
                 current[routes[0]] += k
                 distribute(extra - k, routes[1:], current, results)
                 current[routes[0]] -= k
-    
+
         distributions = []
         distribute(remaining, active, dict(z), distributions)
-    
+
         best_z    = dict(z)
-        best_mtat = float('inf')
-    
+        best_obj  = float('inf')
+
+        # Precompute W_lab coefficient (variable part only; constants don't
+        # affect the argmin over allocations).
+        # D[r]²/H[r] = H[r]*S[r]²  where S[r] = Σdemand_i for clinics on r
+        use_wlab = (K is not None and mu is not None and
+                    rho is not None and rho < 1.0)
+        coeff_beta = (1.0 / (2.0 * K * K * mu * mu * (1.0 - rho))
+                      if use_wlab else 0.0)
+        S = {r: sum(demand_on_route[r].values()) for r in R}
+
         for z_candidate in distributions:
-            obj_val = 0.0
+            tlt_val  = 0.0   # max TLT (MTAT) or sum TLT (ATAT)
+            wlab_var = 0.0   # variable part of W_lab
+
             for r in R:
                 if not demand_on_route[r] or z_candidate[r] == 0:
                     continue
                 H_r = L[r] / z_candidate[r]
+                wlab_var += H_r * S[r] * S[r]   # D[r]²/H[r] = H[r]*S[r]²
+
                 for i in demand_on_route[r]:
-                    tat = 0.5 * H_r + (L[r] - T_visits[r][i])
+                    tlt_i = 0.5 * H_r + (L[r] - T_visits[r][i])
                     if obj == "MTAT_Min":
-                        obj_val = max(obj_val, tat)
-                    else:  # ATAT_Min
-                        obj_val += tat
-            if obj_val < best_mtat:
-                best_mtat = obj_val
-                best_z    = z_candidate
-    
+                        tlt_val = max(tlt_val, tlt_i)
+                    else:
+                        tlt_val += tlt_i
+
+            # Full objective: TLT component + variable part of W_lab
+            if obj == "ATAT_Min":
+                obj_val = (tlt_val / Cn if Cn else tlt_val) + coeff_beta * wlab_var
+            else:   # MTAT_Min
+                obj_val = tlt_val + coeff_beta * wlab_var
+
+            if obj_val < best_obj:
+                best_obj = obj_val
+                best_z   = z_candidate
+
         z = best_z
-    
+
     else:
-        # Greedy distribution for all other objectives
+        # Greedy fallback: score by headway reduction weighted by route demand²
+        # (captures both TLT and W_lab sensitivity)
+        use_wlab   = (K is not None and mu is not None and
+                      rho is not None and rho < 1.0)
+        coeff_beta = (1.0 / (2.0 * K * K * mu * mu * (1.0 - rho))
+                      if use_wlab else 0.0)
+
         for _ in range(max(0, remaining)):
             best_r     = None
             best_score = -float('inf')
-    
+
             for r in R:
                 if not demand_on_route[r]:
                     continue
                 if z[r] >= max(V):
                     continue
-                H_cur = L[r] / z[r]       if (z[r] > 0 and L[r] > 0) else 0.0
-                H_new = L[r] / (z[r] + 1) if L[r] > 0                else 0.0
-                score = H_cur - H_new
+                H_cur  = L[r] / z[r]       if (z[r] > 0 and L[r] > 0) else 0.0
+                H_new  = L[r] / (z[r] + 1) if L[r] > 0                else 0.0
+                dH     = H_cur - H_new
+                S_r    = sum(demand_on_route[r].values())
+                # TLT benefit: dH per clinic; W_lab benefit: dH * S_r²
+                n_r    = len(demand_on_route[r])
+                score  = n_r * 0.5 * dH + coeff_beta * dH * S_r * S_r
                 if score > best_score:
                     best_score = score
                     best_r     = r
-    
+
             if best_r is None:
                 break
             z[best_r] += 1
@@ -233,6 +259,13 @@ def evaluate_solution(routes, obj, mode, C, N, t, demand, Q, V,
         clinics_on_route[r] = [nd for nd in route if nd in C_set]
         demand_on_route[r]  = {i: demand[i] for i in clinics_on_route[r]}
 
+    # rho is constant (all clinics always served) — compute before allocation
+    rho = (1.0 / (K * mu)) * sum(
+        demand[i] for r in R for i in clinics_on_route[r]
+    )
+    if rho >= 1.0:
+        return None
+
     # ---- Vehicle allocation --------------------------------------------------
     if mode == "Single":
         z = {r: (1 if clinics_on_route[r] else 0) for r in R}
@@ -248,7 +281,8 @@ def evaluate_solution(routes, obj, mode, C, N, t, demand, Q, V,
     elif mode == "Multiple":
         z, H = allocate_vehicles(
             routes, L, demand_on_route, Q, V, Vn, Rn, obj,
-            T_visits=T_visits
+            T_visits=T_visits,
+            K=K, mu=mu, rho=rho, Cn=Cn,
         )
         if z is None:
             return None
@@ -256,13 +290,6 @@ def evaluate_solution(routes, obj, mode, C, N, t, demand, Q, V,
             if not clinics_on_route[r]:
                 z[r] = 0
                 H[r] = 0.0
-
-    # ---- Lab utilisation and stability ---------------------------------------
-    rho = (1.0 / (K * mu)) * sum(
-        demand[i] for r in R for i in clinics_on_route[r]
-    )
-    if rho >= 1.0:
-        return None
 
     # ---- Auxiliary variables -------------------------------------------------
     D     = {r: sum(demand[i] * H[r] for i in clinics_on_route[r]) for r in R}
@@ -336,18 +363,30 @@ def generate_initial_solution(C, Rn, Cn, t, demand, Q, V, max_attempts=500):
     """
     Build an initial solution using a greedy nearest-neighbour heuristic.
 
-    Option A: After constructing each route, check that it is feasible
-    at max vehicles.  If not, try a new random shuffle.  Falls back to
-    one-clinic-per-route after max_attempts.
+    Clinic assignment alternates between two strategies (each attempted
+    roughly half the time):
+      - Demand-balanced: sort clinics by demand descending, then assign
+        round-robin so high-demand clinics are spread across routes.
+        This avoids concentrating high-demand clinics on a single route,
+        which is penalised by the D²/H term in W_lab.
+      - Random shuffle: for diversity across restarts.
+
+    Option A feasibility: after construction, check that each route is
+    feasible at max vehicles.  Falls back to one-clinic-per-route.
     """
     C_list = list(C)
 
-    for _ in range(max_attempts):
-        random.shuffle(C_list)
+    for attempt in range(max_attempts):
+        if attempt % 2 == 0:
+            # Demand-balanced: spread high-demand clinics across routes
+            C_sorted = sorted(C_list, key=lambda i: -demand[i])
+        else:
+            C_sorted = C_list[:]
+            random.shuffle(C_sorted)
 
         # Round-robin assignment
         route_clinics = [[] for _ in range(Rn)]
-        for idx, clinic in enumerate(C_list):
+        for idx, clinic in enumerate(C_sorted):
             route_clinics[idx % Rn].append(clinic)
 
         # Nearest-neighbour ordering within each route
